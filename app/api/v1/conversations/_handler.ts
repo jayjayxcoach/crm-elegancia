@@ -1,0 +1,811 @@
+import { createAdminClient } from "@/lib/supabase/admin";
+/**
+ * Core handlers para /api/v1/conversations.
+ *
+ * Reusados pelo Route Handler REST e por MCP tools (S-13.03/04).
+ */
+import type { SupabaseClient } from "@supabase/supabase-js";
+
+import { ApiError } from "@/lib/api/types";
+import type { Actor, HandlerCtx } from "@/lib/api/handlers/types";
+import { audit } from "@/lib/audit";
+import { idsDosCanaisDesativados } from "@/lib/channels/desativado";
+import { traduzir } from "@/lib/i18n/dicionario";
+import { CONVERSATION_TERMINAL_STATUSES } from "@/lib/schemas";
+import type {
+  ListConversationsQuery,
+  PatchConversationInput,
+} from "@/lib/schemas";
+import type { Conversation } from "@/lib/types/messaging";
+import { normalizarTermoDeBusca, termoSemAcento, termoSeguroParaOr } from "@/lib/inbox/termo-de-busca";
+import { ORDEM_DA_ESPERA, ehAFila, comPreFiltroDoComando } from "@/lib/inbox/comando-da-conversa";
+import { aplicarMarcadores } from "@/lib/inbox/marcador-da-conversa";
+import { exigirControleDaConversa } from "@/lib/inbox/controle-da-conversa";
+import { TETO_DE_PESSOAIS, podeVerPessoal } from "@/lib/inbox/pessoal";
+
+// O escape da gramática do `or=` mora na régua única (`lib/inbox/termo-de-busca`);
+// continua exportado daqui porque é daqui que os testes o leem desde a #3918.
+export { termoSeguroParaOr };
+
+type SB = SupabaseClient;
+
+/**
+ * Quantos contatos a busca do Inbox casa antes de cortar.
+ *
+ * Não é um número estético: os ids viajam DENTRO da querystring do PostgREST
+ * (`contact_id.in.(<uuid>,<uuid>,…)`), e requisição GET tem teto no gateway.
+ */
+const TETO_DE_CONTATOS_NA_BUSCA = 120;
+
+/**
+ * O orçamento de bytes que a lista de ids pode ocupar na URL.
+ *
+ * O muro real é 8.192 B na linha de requisição (Kong e nginx, ambos no default),
+ * e a URL leva mais coisa além dos ids: caminho, `select` com todas as
+ * `SELECT_COLS`, o filtro de organização, o `order`, o `limit` e o próprio
+ * `ilike` do termo. Medido neste arquivo, com 1 id a URL já tem 892 B — então o
+ * que sobra para os ids é o resto, e 5.000 B deixa folga confortável para o
+ * termo de busca crescer sem que ninguém precise voltar aqui.
+ *
+ * Cortar por BYTES e não por quantidade é o que faz esta guarda sobreviver a
+ * uma coluna nova em `SELECT_COLS` ou a um formato de id diferente.
+ */
+const ORCAMENTO_DE_IDS_NA_URL = 5_000;
+
+/**
+ * Corta a lista de ids no que cabe no orçamento da URL.
+ *
+ * Devolver menos contatos torna a busca INCOMPLETA — o que é ruim — mas devolver
+ * todos torna a tela QUEBRADA, com `414` virando `500` na cara do operador. Entre
+ * uma lista pobre e uma tela que não abre, a lista pobre ganha; e a diferença
+ * aparece porque a busca por conteúdo (`last_message_preview`) continua rodando
+ * ao lado, sem depender desta lista.
+ */
+function idsQueCabemNaURL(ids: string[]): string[] {
+  const cabem: string[] = [];
+  let bytes = 0;
+  for (const id of ids) {
+    // +1 pela vírgula que separa; o último sobra do lado seguro.
+    const custo = id.length + 1;
+    if (bytes + custo > ORCAMENTO_DE_IDS_NA_URL) break;
+    cabem.push(id);
+    bytes += custo;
+  }
+  return cabem;
+}
+
+const SELECT_COLS = `
+  id, organization_id, contact_id, channel_session_id, channel, status,
+  status_changed_at, service_revision, service_closed_at, service_started_at, current_demanda_id, assigned_to_user_id, assigned_to_user_name, assignee_kind, assigned_at, last_inbound_at, awaiting_since,
+  last_outbound_at, last_message_at, last_message_preview,
+  unread_count_for_assignee, is_group, group_chat_id, tags, metadata,
+  snooze_until, sector_id, created_at, updated_at,
+  bot_silenced_until, last_handoff_at, last_handoff_reason,
+  comando_da_conversa,
+  automatico_da_conversa,
+  usable_for_rag,
+  contacts:contact_id (id, display_name, name, address_book_name, phone_number, is_anonymized, tags, is_blocked, is_personal, personal_owner_user_id, contact_type, avatar_storage_path, force_human),
+  channel_sessions:channel_session_id (phone_number, display_name, provider, social_platform:metadata->>social_platform)
+`;
+
+/**
+ * Os ids dos contatos marcados como pessoais na organização (spec 21, etapa 7).
+ *
+ * A conversa de pessoal some da lista, da busca e das contagens — e `conversations`
+ * não tem a coluna, então quem filtra precisa dos ids antes da query principal
+ * (a mesma primitiva da busca por contato). Cortados pelo orçamento da URL, como
+ * os da busca: pessoal se marca um a um, à mão, então a lista é curta por
+ * construção — mas o teto impede o `414` se um dia não for.
+ *
+ * Exportado porque a rota de contagens (`counts/route.ts`) aplica a MESMA
+ * exclusão: badge que conta o que a aba não mostra manda o atendente procurar
+ * trabalho que não existe.
+ */
+export async function idsDeContatosPessoais(
+  supabase: SB,
+  organizationId: string,
+): Promise<string[]> {
+  const { data } = await supabase
+    .from("contacts")
+    // Service role bypassa RLS: o filtro de organização é manual e obrigatório.
+    .select("id")
+    .eq("organization_id", organizationId)
+    .eq("is_personal", true)
+    .limit(500);
+  return idsQueCabemNaURL((data ?? []).map((c) => (c as { id: string }).id));
+}
+
+/**
+ * Os ids do pessoal que ESTE ator pode ver (issue #4434 — a aba Pessoal).
+ *
+ * ─── Por que existe ────────────────────────────────────────────────────────
+ *
+ * A spec 21 escondeu o pessoal da operação e, no mesmo gesto, o tornou
+ * inalcançável para todos — inclusive para quem marcou. A #4434 separa as duas
+ * coisas: esconder da operação continua valendo, mas quem marcou lê e responde
+ * o SEU.
+ *
+ * ─── A régua ═══
+ *
+ * Só existe UMA entrada: ser o dono da marca (`personal_owner_user_id`). Não há
+ * exceção por papel — `admin` e `manager` não leem o pessoal de outra pessoa,
+ * porque o dano de uma porta esquecida aqui não é bug de UX: é a conversa de
+ * família de alguém aparecendo na tela de outro. Foi por isso que a régua não
+ * recebe `role` nem `verTodos`: sem parâmetro, não há como ligar a exceção por
+ * engano (o desenho de referência do PR #4187 tinha `admin` vendo tudo — e é
+ * exatamente o que a #4434 NÃO aprova).
+ *
+ * Contato sem dono (marcado antes da migration 9360, ou dono removido) não casa
+ * ninguém: fica invisível até alguém marcar de novo e adotar.
+ *
+ * Ator que não é pessoa (`api_token`/`ai_agent`) nunca casa o dono: o MCP
+ * continua sem ver pessoal (spec 21 §6.1, mantida).
+ */
+export async function idsDeContatosPessoaisVisiveis(
+  supabase: SB,
+  organizationId: string,
+  userId: string | null,
+): Promise<string[]> {
+  // Sem pessoa não há dono — e `undefined` no `.eq` viraria filtro AUSENTE, que
+  // devolveria o pessoal de toda a organização. Falha fechada, de propósito.
+  if (!userId) return [];
+  const { data } = await supabase
+    .from("contacts")
+    // Service role bypassa RLS: o filtro de organização é manual e obrigatório.
+    .select("id")
+    .eq("organization_id", organizationId)
+    .eq("is_personal", true)
+    .eq("personal_owner_user_id", userId)
+    .limit(TETO_DE_PESSOAIS);
+  return idsQueCabemNaURL((data ?? []).map((c) => (c as { id: string }).id));
+}
+
+// A régua do pessoal mora em `lib/inbox/pessoal` porque três caminhos a usam
+// (a ficha da conversa aqui, o histórico e o envio em `messages/_handler`).
+// Reexportada daqui porque é deste módulo que os testes e os chamadores a leem
+// desde a spec 21; uma segunda cópia divergiria na primeira condição nova.
+export { podeVerPessoal };
+
+interface CursorPayload {
+  sort: string | null;
+  id: string;
+}
+
+function encodeCursor(p: CursorPayload): string {
+  return Buffer.from(JSON.stringify(p), "utf8").toString("base64url");
+}
+function decodeCursor(raw: string): CursorPayload | null {
+  try {
+    const json = Buffer.from(raw, "base64url").toString("utf8");
+    const parsed = JSON.parse(json) as CursorPayload & { last_message_at?: string | null };
+    if (typeof parsed.id !== "string") return null;
+    // `last_message_at` é o nome legado do campo de ordenação (cursores em voo
+    // durante deploy); `sort` é o genérico atual (default OU fila).
+    const sort = parsed.sort ?? parsed.last_message_at ?? null;
+    return { sort, id: parsed.id };
+  } catch {
+    return null;
+  }
+}
+
+function actorAuditPayload(actor: Actor): {
+  actorUserId: string | null;
+  metadataActor: Record<string, unknown>;
+} {
+  if (actor.type === "user") {
+    return { actorUserId: actor.id, metadataActor: { actor_type: "user" } };
+  }
+  return {
+    actorUserId: null,
+    metadataActor: {
+      actor_type: actor.type,
+      actor_id: actor.id,
+      ...(actor.type === "ai_agent" && actor.api_token_id
+        ? { actor_api_token_id: actor.api_token_id }
+        : {}),
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// list
+// ---------------------------------------------------------------------------
+
+export interface ListConversationsResult {
+  conversations: Conversation[];
+  cursor: string | null;
+  has_more: boolean;
+}
+
+export async function listConversationsHandler(
+  supabase: SB,
+  ctx: HandlerCtx,
+  q: ListConversationsQuery,
+): Promise<ListConversationsResult> {
+  // Fila: ordena por TEMPO DE ESPERA — quem espera há mais tempo primeiro. A
+  // régua é `awaiting_since` = a mensagem do cliente MAIS ANTIGA sem resposta
+  // (não `last_inbound_at`, que é reescrito a cada mensagem dele e fazia quem
+  // insiste descer para o fim da fila — #990; e não `created_at`, que pode ser uma
+  // conversa antiga reaberta). Demais visões: por atividade recente.
+  // A Fila deixou de se identificar por `assigned_to=unassigned` — ela agora pede
+  // `comando`. Sem esta linha o `isQueue` ficaria PARA SEMPRE falso na aba Fila e
+  // a ordenação por tempo de espera sumiria **sem nenhum sintoma na tela**: a
+  // lista continuaria populada, só que ordenada por atividade recente, e quem
+  // espera desde ontem afundaria embaixo de quem escreveu agora.
+  const isQueue = ehAFila(q);
+  // A régua da Fila não se escreve aqui: vem de `ORDEM_DA_ESPERA`, a mesma que
+  // numera a posição da linha na tela e o número que o cliente ouve. Enquanto
+  // cada lugar tinha a sua cópia, trocar uma só fazia a lista ordenar por uma
+  // pergunta e a posição responder outra — sem sintoma nenhum, porque as duas
+  // telas continuam populadas e plausíveis.
+  const sortCol = isQueue ? ORDEM_DA_ESPERA.coluna : "last_message_at";
+  const ordem = isQueue ? ORDEM_DA_ESPERA.opcoes : ({ ascending: false, nullsFirst: false } as const);
+  const asc = isQueue;
+
+  let query = supabase
+    .from("conversations")
+    .select(SELECT_COLS)
+    .eq("organization_id", ctx.organization_id)
+    .order(sortCol, ordem)
+    .order("id", { ascending: asc })
+    .limit(q.limit + 1);
+
+  // ── CONTATO PESSOAL: escondido da OPERAÇÃO, alcançável pelo DONO ────────
+  //
+  // Spec 21 (etapa 7): conversa de contato pessoal não aparece em nenhuma visão
+  // de trabalho — some da lista, da busca e das contagens, ANTES de todo filtro
+  // opcional, para que cursor e `has_more` descrevam o conjunto já escondido.
+  //
+  // #4434 (a aba "Pessoal"): a MESMA régua, com o sinal invertido quando a aba
+  // pede `?pessoais=true`. Aí a lista mostra SÓ o pessoal de quem está olhando, e
+  // NADA mais. Ator que não é pessoa nunca chega aqui (a primitiva devolve vazio),
+  // então um token do MCP não lista pessoal nem pedindo o filtro.
+  const atorHumanoId = ctx.actor.type === "user" ? ctx.actor.id : null;
+  const querPessoal = q.pessoais === true || q.pessoais === "true";
+  if (querPessoal) {
+    const visiveis = await idsDeContatosPessoaisVisiveis(
+      supabase,
+      ctx.organization_id,
+      atorHumanoId,
+    );
+    // Conjunto vazio é RESPOSTA (ninguém marcou nada, ou nada é meu) — e não
+    // pode virar `in ()`, que é SQL inválido no PostgREST e faria a aba Pessoal
+    // responder 500 justamente para quem nunca marcou ninguém.
+    if (visiveis.length === 0) return { conversations: [], cursor: null, has_more: false };
+    query = query.in("contact_id", visiveis);
+  } else {
+    const pessoais = await idsDeContatosPessoais(supabase, ctx.organization_id);
+    if (pessoais.length > 0) {
+      query = query.not("contact_id", "in", `(${pessoais.join(",")})`);
+    }
+  }
+
+  // `.in` e não `.eq`: o filtro agora chega como LISTA (um valor vira lista de um,
+  // e o SQL resultante é equivalente). É o que deixa a aba Fila pedir os dois
+  // estados de espera numa consulta só, em vez de filtrar em memória o que a
+  // página já truncou.
+  if (q.status && q.status.length > 0) query = query.in("status", q.status);
+  // O filtro de QUEM MANDA (migration 0203). Vai no banco, e não em memória, para
+  // o cursor de paginação continuar valendo: filtrar depois de paginar devolveria
+  // páginas curtas e um "carregar mais" que às vezes não traz nada.
+  if (q.comando && q.comando.length > 0) {
+    // O PRÉ-FILTRO (#4325): quando o comando pedido é subconjunto de
+    // {aguardando, automatico}, as duas condições que a função já exige
+    // (sem dono, status fora do histórico fechado) vão também para o `WHERE`.
+    // Elas NÃO substituem `comando_da_conversa` — só reduzem as linhas que ela
+    // avalia, que hoje são todas as da organização. Comando fora do conjunto
+    // devolve a consulta intacta.
+    query = comPreFiltroDoComando(query.in("comando_da_conversa", q.comando), q.comando);
+  }
+  // Depois do `status` de propósito: pedir um status terminal E `exclude_finished`
+  // é contradição, e a resposta certa para uma contradição é lista vazia — não
+  // um dos dois lados escolhido em silêncio.
+  if (q.exclude_finished) {
+    query = query.not("status", "in", `(${CONVERSATION_TERMINAL_STATUSES.join(",")})`);
+  }
+  if (q.closed_since) query = query.gte("service_closed_at", q.closed_since);
+  if (q.channel_session_id) query = query.eq("channel_session_id", q.channel_session_id);
+  // A FILA (#3876). Igualdade numa coluna que existe desde a 9062 — sem `or=`,
+  // sem junção: a lista que o seletor de fila do Inbox mostra é esta.
+  if (q.sector_id) query = query.eq("sector_id", q.sector_id);
+  // Canal desativado nunca entra na inbox (quarentena): exclui as conversas
+  // dele aqui e nos badges, mantendo o acesso direto por id para auditoria e
+  // suporte. Reativou, reaparecem sem reimportar nada.
+  const idsDesativados = await idsDosCanaisDesativados(supabase, ctx.organization_id);
+  if (idsDesativados.length > 0) {
+    query = query.not("channel_session_id", "in", `(${idsDesativados.join(",")})`);
+  }
+  // ── O CONTATO, NO PRÓPRIO `WHERE` (#2184) ──────────────────────────────
+  //
+  // `crm_list_conversations` filtrava o contato DEPOIS do handler devolver a
+  // página: a conversa mais antiga do mesmo cliente, fora daquela página, era
+  // inalcançável — e o `has_more: false` que saía junto dizia ao agente que
+  // não havia mais nada. Filtrar antes do `.limit` é o que faz cursor e
+  // `has_more` descreverem o conjunto DO CONTATO: a próxima página continua
+  // sendo do mesmo cliente.
+  //
+  // Compondo sobre a MESMA query, que já carrega `.eq("organization_id", …)` —
+  // este handler usa o admin client, que passa por cima da RLS: o filtro
+  // manual de organização é a única barreira, e uma consulta nova nasceria
+  // sem nenhuma.
+  if (q.contact_id) query = query.eq("contact_id", q.contact_id);
+  // A aba "Grupos" (Task 10). `undefined` (ausente) = sem filtro, a lista
+  // mostra tudo, como hoje — checagem explícita contra `undefined`, e não
+  // `if (q.is_group)`, porque `"false"` é um valor válido e verdadeiro-truthy
+  // como string.
+  if (q.is_group !== undefined) query = query.eq("is_group", q.is_group === "true");
+  // ⚠️ O MARCADOR FILTRADO É O DA CONVERSA **OU** O DO CONTATO.
+  //
+  // Era só `conversations.tags`, e o relato mede o buraco: *"adicionei a tag nele
+  // para testar e ele n aparece no filtro"* — o marcador fora posto no CONTATO
+  // (`ContactTagsEditor`, a mesma caixa da ficha e da campanha). Trocar a fonte
+  // pelo contato consertaria o relato e tiraria o filtro de quem marca a
+  // CONVERSA (`ConversationTagsEditor`, e a IA por `crm_manage_tags`): o marcador
+  // continuaria editável e deixaria de ser filtrável. As duas caixas, então.
+  //
+  // O lado do contato é o campo calculado `tags_do_contato` (migration 0323), e
+  // não um `contact_id.in.(…)`: a lista de ids viaja na URL e tem teto (ver
+  // `idsQueCabemNaURL`) — numa org com mais contatos marcados que isso, conversas
+  // sumiriam do filtro sem aviso. Este `or=` compõe por AND com o da busca e o do
+  // cursor: o PostgREST junta os parâmetros repetidos com E.
+  // A régua do marcador mora num lugar só (`lib/inbox/marcador-da-conversa.ts`),
+  // porque a segunda régua sempre diverge: foi assim que a contagem das abas
+  // passou a pedir uma coluna que não existe (#1223). Aqui ela é só aplicada.
+  //
+  // ⚠️ `aplicarMarcadores`, e o `modo` vai junto (#1274). O filtro passou a
+  // aceitar VÁRIAS etiquetas com E/OU, e `aplicarMarcadores` é quem sabe as
+  // duas coisas: que uma etiqueta só tem de sair byte a byte como antes, e que
+  // E (`cs`) e OU (`ov`) são operadores diferentes. Chamar `aplicarMarcador`
+  // aqui com a lista inteira faria o TypeScript aceitar e o filtro casar o
+  // ARRAY como se fosse um marcador só — lista vazia, sem erro.
+  if (q.tag) query = aplicarMarcadores(query, q.tag, q.modo);
+
+  // No BANCO, e não em memória: filtrar depois de paginar devolveria páginas curtas —
+  // e, quando a página inteira estivesse lida, uma lista vazia que a tela apresentava
+  // como caixa vazia, sem sequer oferecer "Carregar mais".
+  //
+  // ⛔ Compõe sobre `query`, que JÁ tem `.eq("organization_id", ctx.organization_id)`.
+  // Este handler usa o admin client, que passa por cima da RLS: esse filtro é a Única
+  // barreira. Consulta nova só para os não lidos nasceria sem barreira nenhuma.
+  if (q.unread) query = query.gt("unread_count_for_assignee", 0);
+
+  if (q.assigned_to === "me") {
+    if (ctx.actor.type !== "user") {
+      throw new ApiError(
+        400,
+        "invalid_request",
+        undefined,
+        ctx.requestId,
+        '"assigned_to=me" requer ator humano.',
+      );
+    }
+    // "Minhas" é também o que eu PARTICIPO: o convite é da conversa e a aba Minhas
+    // é onde a convidada tem de achar — medido com navegador na mão no CR de 24/10
+    // (#2848). Sem isto, com `own_and_unassigned` ela nem alcança a aba "Todas" e a
+    // conversa não aparece em lugar nenhum: Fila 0, Minhas 0.
+    //
+    // Sem participações o predicado é o MESMO de antes (`.eq`), byte a byte: o `or`
+    // só nasce quando existe convite de pé, então quem não participa de nada mede o
+    // mesmo de sempre. Quando existe, o `or=` compõe por AND com os demais
+    // (organização, busca, cursor): o PostgREST junta parâmetros repetidos com E.
+    // ⚠️ Se esta pergunta falhar (banco fora, mock de teste sem `.is`), o caminho
+    // é o de SEMPRE (`.eq`): o filtro nunca muda de regra sozinho, só ganha as
+    // conversas de quem participa quando a pergunta responde.
+    let idsParticipadas: string[] = [];
+    try {
+      const participadas = await supabase
+        .from("conversation_participants")
+        .select("conversation_id")
+        .eq("organization_id", ctx.organization_id)
+        .eq("user_id", ctx.actor.id)
+        .is("left_at", null);
+      idsParticipadas = (participadas.data ?? []).map((r) => r.conversation_id);
+    } catch {
+      idsParticipadas = [];
+    }
+    if (idsParticipadas.length > 0) {
+      // ⚠️ participações ativas são convites manuais (poucas por pessoa) — daí
+      // entrarem juntas no `in()`. Se um dia alguém participar de centenas, este
+      // `or=` fica longo; aí o conserto é subquery via RPC — e nunca corte
+      // silencioso: um corte escondido manda a convidada voltar a não achar.
+      query = query.or(
+        `assigned_to_user_id.eq.${ctx.actor.id},id.in.(${idsParticipadas.join(",")})`,
+      );
+    } else {
+      query = query.eq("assigned_to_user_id", ctx.actor.id);
+    }
+  } else if (q.assigned_to === "unassigned") {
+    query = query.is("assigned_to_user_id", null);
+  } else if (q.assigned_to) {
+    query = query.eq("assigned_to_user_id", q.assigned_to);
+  }
+
+  if (q.search) {
+    // ─── O TERMO NÃO PODE QUEBRAR A SINTAXE DO `.or()` ────────────────────
+    //
+    // Dois escapes diferentes, para dois parsers diferentes, e eles NÃO se
+    // substituem:
+    //
+    //   `%` e `_` são curingas do `ilike` (Postgres) — escapados com `\`.
+    //   `,` `(` `)` são a GRAMÁTICA do `or=` (PostgREST) — e para eles o
+    //   PostgREST não oferece escape nenhum dentro de um valor sem aspas.
+    //
+    // Medido contra o PostgREST v14.10 do stack local deste repo, buscando um
+    // contato que existe:
+    //
+    //   or=(display_name.ilike.*DIAG, 178*,…)   → HTTP 400 PGRST100
+    //                                             "failed to parse logic tree"
+    //   or=(display_name.ilike.*DIAG* 178*,…)   → 200, 3 resultados
+    //
+    // Ou seja: um cliente cadastrado como "Sobrenome, Nome" — que é como meia
+    // agenda de CRM é digitada — DERRUBA a busca do Inbox, não devolve lista
+    // vazia. E a vírgula não precisa estar no banco: basta o atendente digitá-la.
+    //
+    // AS DUAS SAÍDAS ÓBVIAS FORAM MEDIDAS E AS DUAS FALHAM:
+    //
+    //   aspas duplas no valor .... `ilike."*IAG*"` → 0 resultados contra
+    //                              `ilike.*IAG*` → 3. Dentro das aspas o `*`
+    //                              deixa de ser curinga; consertaria a sintaxe
+    //                              e mataria a busca.
+    //   barra invertida .......... `ilike.*I\,AG*` → HTTP 400. O PostgREST não
+    //                              tem escape para a vírgula fora de aspas.
+    //
+    // O que sobra, e é o que está aqui: trocar o metacaractere pelo PRÓPRIO
+    // curinga. "Silva, João" vira `*Silva* João*`, que casa "Silva, João" no
+    // banco — o `%` cobre a vírgula. A busca fica ligeiramente mais larga, e
+    // essa direção é a certa: o custo é achar um vizinho a mais; o custo do
+    // outro lado é a tela em branco com 400.
+    //
+    // O controle que impede o degenerado está no teste: termo inexistente
+    // continua devolvendo ZERO. Sem ele, "troque tudo por `*`" passaria.
+    // Duas normalizações, em ordem, com responsabilidades diferentes:
+    //   normalizarTermoDeBusca → como a PESSOA digitou (espaço duplo, vírgula e
+    //                            ponto e vírgula viram o mesmo curinga)
+    //   termoSeguroParaOr      → a GRAMÁTICA do `or=` do PostgREST (não mexer)
+    //
+    // A ordem importa e a composição é segura: `termoSeguroParaOr` escapa `%` e
+    // `_` e troca `,()` por `*`, mas NÃO escapa `*` — então o curinga posto pela
+    // primeira chega inteiro ao banco. O telefone também sobrevive: `somenteDigitos`
+    // descarta tudo que não é dígito, inclusive o curinga.
+    const s = termoSeguroParaOr(normalizarTermoDeBusca(q.search));
+
+    // ─── A BUSCA ALCANÇA O CONTATO, NÃO SÓ A ÚLTIMA MENSAGEM ──────────────
+    //
+    // Aqui havia só o `ilike` em `last_message_preview`. Para um atendente,
+    // achar a conversa pelo NOME do cliente é o caso mais comum — bem mais que
+    // lembrar um trecho literal de mensagem —, e com milhares de contatos
+    // importados a única saída era rolar a lista. (issue #341)
+    //
+    // Dois passos, e não um `!inner` no embed do contato: transformar o embed
+    // em inner mudaria a semântica da LISTA inteira (conversa sem contato
+    // sumiria da caixa). A consulta curta abaixo devolve ids e o predicado os
+    // soma ao casamento por conteúdo, que continua valendo.
+    const somenteDigitos = s.replace(/\D/g, "");
+    // 4 dígitos é o piso: "12" casaria metade da base e devolveria a lista
+    // inteira embaralhada — pior que não achar, porque PARECE que funcionou.
+    const pareceTelefone = somenteDigitos.length >= 4;
+
+    // ─── O CASAMENTO DE TEXTO SAI DE DENTRO DA RLS (#4326, fatia 1, item b) ──
+    //
+    // Aqui havia um `or=` com `busca_sem_acento.like` e `phone_number.ilike`, e
+    // uma SEGUNDA consulta a `contact_phones` para o telefone extra. As duas
+    // liam a organização inteira: `like`/`ilike` não são `leakproof`, e com RLS
+    // na tabela o planejador não pode usá-los como condição de índice antes de
+    // avaliar a política. Medido em Postgres descartável — 40 mil contatos na
+    // organização, busca que casa 1: `Rows Removed by Filter: 40000`, 37,0 ms.
+    // O custo cresce com a ORGANIZAÇÃO, não com o que a busca acha, e criar o
+    // índice de trigrama sozinho não muda o plano (medido: com os índices no
+    // lugar e `analyze` feito, a mesma consulta sob RLS gasta 35,7 ms e segue
+    // `Rows Removed by Filter: 40000`; o MESMO SQL como dono da tabela vira
+    // `BitmapOr` sobre os dois índices de trigrama, em 0,24 ms).
+    //
+    // `fn_contatos_da_busca` faz o MESMO casamento num `security definer`: ela
+    // confere a organização contra `fn_user_org_ids()` (quem tem sessão e não é
+    // membro recebe ZERO linha; sem `auth.uid()` a chamada é do servidor, que já
+    // bypassa RLS) e repete o filtro de organização nas duas tabelas. O termo
+    // chega no mesmo formato de antes, com UMA troca de dialeto: o `*` que o
+    // `or=` do PostgREST converte em `%` vira `%` aqui, porque no `like` do SQL
+    // ele é literal. O `\%` posto por `termoSeguroParaOr` já é o escape do
+    // próprio LIKE, então `%`/`_` digitados continuam literais. O termo vai SEM
+    // ACENTO: ele casa a coluna gerada (`busca_sem_acento`) e o telefone com o
+    // MESMO texto — dígito não tem acento, e um termo acentuado não pode deixar
+    // de achar o contato. O que volta são IDs: a leitura das linhas continua
+    // sendo a da query principal, pelo cliente da sessão, e `contact_id.in.(...)`
+    // é igualdade de uuid (`leakproof`). Quem decide o que a pessoa vê continua
+    // sendo a RLS, não a função.
+    //
+    // ─── AS REGRAS QUE A `main` GANHOU NESTE TRECHO NÃO SAÍRAM ──────────────
+    //
+    // Elas entraram como ARGUMENTO da função — o mesmo lugar do casamento, e não
+    // uma segunda condição que possa divergir:
+    //
+    //   · o nome casa sem acento (#3918) pela coluna gerada `busca_sem_acento`
+    //     (`lower(public.f_unaccent(display_name, name, address_book_name))`) e
+    //     pelo `termoSemAcento` — a mesma régua em TypeScript, conferida por
+    //     `tests/invariants/busca-do-inbox-ignora-acento.test.ts`; o nome da
+    //     agenda do celular (#2439) é a terceira parte da coluna;
+    //   · pessoal não é achado FORA da aba dele (spec 21, etapa 7 — critério 2)
+    //     e DENTRO da aba o sinal INVERTE pelo MESMO booleano da lista (#4434):
+    //     `q.pessoais` vira `p_pessoal`, e `p_dono` leva o dono para o pessoal do
+    //     colega não entrar. Era o `is_personal = querPessoal` + o filtro de dono
+    //     das duas consultas que a fatia substituiu;
+    //   · o telefone EXTRA continua ignorando a lápide da fusão
+    //     (`is_merged_into is null`) e o anonimizado nunca casa (`is_anonymized
+    //     = false`) — dentro da função, no braço que substituiu a segunda
+    //     consulta a `contact_phones`.
+    const termoDaBusca = termoSemAcento(s).replace(/\*/g, "%");
+    const { data: idsCasados, error: erroDaBusca } = await supabase.rpc(
+      "fn_contatos_da_busca",
+      {
+        p_org: ctx.organization_id,
+        p_termo: termoDaBusca,
+        p_digitos: pareceTelefone ? [somenteDigitos] : [],
+        p_limite: TETO_DE_CONTATOS_NA_BUSCA,
+        p_pessoal: querPessoal,
+        p_dono: querPessoal ? atorHumanoId : null,
+      },
+    );
+    if (erroDaBusca) {
+      throw new ApiError(500, "internal_error", undefined, ctx.requestId, erroDaBusca.message);
+    }
+    // Teto de BYTES: a lista de ids viaja na URL do PostgREST e uma busca por
+    // "a" sem limite estoura a requisição (ver `idsQueCabemNaURL`).
+    const ids = idsQueCabemNaURL(
+      ((idsCasados ?? []) as { contact_id: string }[]).map((linha) => linha.contact_id),
+    );
+    if (ids.length > 0) {
+      query = query.or(
+        `last_message_preview.ilike.*${s}*,contact_id.in.(${ids.join(",")})`,
+      );
+    } else {
+      // Sem ids casados, um `contact_id.in.()` vazio é SQL inválido no
+      // PostgREST — a busca por conteúdo segue sozinha, como antes.
+      query = query.ilike("last_message_preview", `%${s}%`);
+    }
+  }
+
+  if (q.cursor) {
+    const c = decodeCursor(q.cursor);
+    if (!c) {
+      throw new ApiError(
+        400,
+        "invalid_cursor",
+        undefined,
+        ctx.requestId,
+        traduzir("Cursor inválido.", ctx.idioma ?? "pt-BR"),
+      );
+    }
+    const op = asc ? "gt" : "lt";
+    if (c.sort) {
+      query = query.or(
+        `${sortCol}.${op}.${c.sort},and(${sortCol}.eq.${c.sort},id.${op}.${c.id})`,
+      );
+    } else {
+      // Página já na região de sort NULL (nulls last): pagina só por id.
+      query = query.is(sortCol, null);
+      query = asc ? query.gt("id", c.id) : query.lt("id", c.id);
+    }
+  }
+
+  const { data, error } = await query;
+  if (error) {
+    throw new ApiError(500, "internal_error", undefined, ctx.requestId, error.message);
+  }
+
+  const rows = (data ?? []) as unknown as Conversation[];
+  const hasMore = rows.length > q.limit;
+  const page = hasMore ? rows.slice(0, q.limit) : rows;
+  const last = page[page.length - 1];
+  const cursor =
+    hasMore && last
+      ? encodeCursor({ sort: (last[sortCol] as string | null) ?? null, id: last.id })
+      : null;
+
+  return { conversations: page, cursor, has_more: hasMore };
+}
+
+// ---------------------------------------------------------------------------
+// get
+// ---------------------------------------------------------------------------
+
+export async function getConversationHandler(
+  supabase: SB,
+  ctx: HandlerCtx,
+  conversationId: string,
+): Promise<Conversation> {
+  const { data, error } = await supabase
+    .from("conversations")
+    .select(SELECT_COLS)
+    .eq("id", conversationId)
+    .eq("organization_id", ctx.organization_id)
+    .maybeSingle();
+
+  if (error) {
+    throw new ApiError(500, "internal_error", undefined, ctx.requestId, error.message);
+  }
+  if (!data) {
+    throw new ApiError(
+      404,
+      "not_found",
+      undefined,
+      ctx.requestId,
+      traduzir("Conversa não encontrada.", ctx.idioma ?? "pt-BR"),
+    );
+  }
+  // Pessoal some até por link direto para QUEM NÃO É DONO (spec 21, D10 —
+  // critério 1; #4434): a conversa responde 404, com a mesma mensagem de "não
+  // existe", para não revelar que ela está lá. O dono da marca abre normalmente —
+  // é o que a aba Pessoal mostra —, e ninguém mais: nem `admin`, nem `manager`.
+  // Ator que não é pessoa (token MCP) continua recebendo 404 em todo caso,
+  // porque `podeVerPessoal` só reconhece `user`.
+  const contato = (
+    data as unknown as {
+      contacts?: { is_personal?: boolean; personal_owner_user_id?: string | null } | null;
+    }
+  ).contacts;
+  if (!podeVerPessoal(ctx.actor, contato)) {
+    throw new ApiError(
+      404,
+      "not_found",
+      undefined,
+      ctx.requestId,
+      traduzir("Conversa não encontrada.", ctx.idioma ?? "pt-BR"),
+    );
+  }
+  return data as unknown as Conversation;
+}
+
+// ---------------------------------------------------------------------------
+// update status (claim/close/release)
+// ---------------------------------------------------------------------------
+
+export async function patchConversationHandler(
+  supabase: SB,
+  ctx: HandlerCtx,
+  conversationId: string,
+  input: PatchConversationInput,
+): Promise<Conversation> {
+  const update: Record<string, unknown> = {};
+  const observed = input.status !== undefined
+    ? await getConversationHandler(supabase, ctx, conversationId)
+    : null;
+  if (observed) await exigirControleDaConversa(supabase, ctx, observed);
+
+  /**
+   * O ATALHO `status='claimed'` PASSA PELA RPC, e não escreve o dono aqui.
+   *
+   * Ele gravava `assigned_to_user_id` direto na tabela, e isso deixava TRÊS
+   * coisas para trás em relação ao `POST /claim`: nenhum evento em
+   * `conversation_assignment_events` (a auditoria de troca de dono simplesmente
+   * não existia por este caminho), `assignee_kind` intocado — o que viola a
+   * constraint `conversations_assignee_kind_coherence` quando a linha já tinha
+   * `assignee_kind='ai'` — e, desde a 0173, o silêncio do automático não sendo
+   * ligado, produzindo uma conversa com dono humano e o robô ainda respondendo.
+   *
+   * É a API pública versionada, alcançável por qualquer bearer agent+: dois
+   * caminhos de assumir com efeitos diferentes é o defeito, não a conveniência.
+   */
+  const assumirPelaRpc =
+    input.status === "claimed" && ctx.actor.type === "user" ? ctx.actor.id : null;
+
+  if (assumirPelaRpc !== null) {
+    const { error: erroRpc } = await supabase.rpc("fn_conversation_assign", {
+      p_organization_id: ctx.organization_id,
+      p_conversation_id: conversationId,
+      p_to_user_id: assumirPelaRpc,
+      p_reason: "claim",
+      p_expected_assignee: null,
+      // Sem lock otimista: este atalho nunca teve um, e passar a exigi-lo faria
+      // um cliente da API que hoje funciona começar a receber 409.
+      p_enforce_expected: false,
+    });
+    if (erroRpc) {
+      throw new ApiError(500, "internal_error", undefined, ctx.requestId, erroRpc.message);
+    }
+  }
+
+  if (input.status !== undefined) {
+    const { error: statusError } = await createAdminClient().rpc("fn_service_status", {
+      p_org: ctx.organization_id, p_conversation: conversationId, p_status: input.status,
+      p_expected: input.expected_revision ?? observed?.service_revision,
+    });
+    // PT409: revisão obsoleta (migration 0514). 40001: contato trocou no meio, ou banco anterior à 0514.
+    const conflito = statusError?.code === "PT409" || statusError?.code === "40001";
+    if (statusError) throw new ApiError(conflito ? 409 : statusError.code === "P0002" ? 404 : 500,
+      conflito ? "conflict" : statusError.code === "P0002" ? "not_found" : "internal_error", undefined, ctx.requestId,
+      conflito ? traduzir("O atendimento mudou. Atualize e tente novamente.", ctx.idioma ?? "pt-BR") : statusError.message);
+  }
+  if (input.tags !== undefined) {
+    update.tags = input.tags;
+  }
+
+  const query = Object.keys(update).length > 0
+    ? supabase.from("conversations").update(update)
+    : supabase.from("conversations");
+  const { data, error } = await query.select(SELECT_COLS)
+    .eq("id", conversationId)
+    .eq("organization_id", ctx.organization_id)
+    .maybeSingle();
+
+  if (error) {
+    throw new ApiError(500, "internal_error", undefined, ctx.requestId, error.message);
+  }
+  if (!data) {
+    throw new ApiError(
+      404,
+      "not_found",
+      undefined,
+      ctx.requestId,
+      traduzir("Conversa não encontrada.", ctx.idioma ?? "pt-BR"),
+    );
+  }
+
+  const conv = data as unknown as Conversation;
+
+  const a = actorAuditPayload(ctx.actor);
+
+  if (input.status !== undefined) {
+    const action =
+      input.status === "claimed"
+        ? "conversation.claimed"
+        : input.status === "closed"
+          ? "conversation.closed"
+          : input.status === "archived"
+            ? "conversation.archived"
+            : "conversation.released";
+    await audit({
+      action,
+      actorUserId: a.actorUserId,
+      organizationId: conv.organization_id,
+      resourceType: "conversation",
+      resourceId: conv.id,
+      requestId: ctx.requestId,
+      metadata: { ...a.metadataActor, status: input.status },
+    });
+  }
+  if (input.tags !== undefined) {
+    await audit({
+      action: "conversation.tags_changed",
+      actorUserId: a.actorUserId,
+      organizationId: conv.organization_id,
+      resourceType: "conversation",
+      resourceId: conv.id,
+      requestId: ctx.requestId,
+      metadata: { ...a.metadataActor, tags: input.tags },
+    });
+  }
+
+  return conv;
+}
+
+// ---------------------------------------------------------------------------
+// mark read
+// ---------------------------------------------------------------------------
+
+export async function markConversationReadHandler(
+  supabase: SB,
+  ctx: HandlerCtx,
+  conversationId: string,
+): Promise<Conversation> {
+  const { data, error } = await supabase
+    .from("conversations")
+    .update({ unread_count_for_assignee: 0 })
+    .eq("id", conversationId)
+    .eq("organization_id", ctx.organization_id)
+    .select(SELECT_COLS)
+    .maybeSingle();
+
+  if (error) {
+    throw new ApiError(500, "internal_error", undefined, ctx.requestId, error.message);
+  }
+  if (!data) {
+    throw new ApiError(
+      404,
+      "not_found",
+      undefined,
+      ctx.requestId,
+      traduzir("Conversa não encontrada.", ctx.idioma ?? "pt-BR"),
+    );
+  }
+  return data as unknown as Conversation;
+}

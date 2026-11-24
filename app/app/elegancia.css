@@ -1,0 +1,354 @@
+/* ─────────────────────────────────────────────────────────────────────────
+   ELEGANCIA — barra lateral y barra superior del prototipo aprobado.
+   Solo existen cuando la organización usa la plantilla "elegancia"
+   (AppShell monta DockElegancia y TopBarElegancia). Claro: vidrio blanco;
+   oscuro: carbón con borde fino y luz lavanda.
+   ───────────────────────────────────────────────────────────────────────── */
+:root {
+  --eleg-glass: linear-gradient(155deg, #ffffffa8 0%, #ffffff5c 42%, #ffffff3d 70%, #ffffff6b 100%);
+  --eleg-rim: #ffffff4d;
+  --eleg-blur: blur(30px) saturate(185%);
+  --eleg-shadow: inset 0 1px 0 #ffffffeb, inset 0 0 32px #ffffff45, 0 24px 60px -30px #1e283c4d, 0 2px 6px -2px #1e283c14;
+  --eleg-text: #13171a;
+  --eleg-well: #1216140f;
+  --eleg-line: #1216142e;
+  --eleg-pill: #13171a;
+  --eleg-on-pill: #f6f7f3;
+  --eleg-pill-shadow: none;
+  --eleg-float: #f8faf6;
+  --eleg-pop: 0 24px 60px -18px #0f191459, 0 2px 6px #0f191414;
+  --eleg-logo: #13171a;
+  --eleg-on-logo: #ffffff;
+}
+[data-theme="dark"] {
+  --eleg-glass: radial-gradient(120% 90% at 85% 115%, #7a7cc94d, #0000 60%), linear-gradient(180deg, #ffffff0d, #ffffff00 40%), #15161bd1;
+  --eleg-rim: #ffffff1f;
+  --eleg-shadow: inset 0 1px 0 #ffffff26, 0 30px 60px -24px #000000e6;
+  --eleg-text: #f3f3f7;
+  --eleg-well: #ffffff12;
+  --eleg-line: #ffffff24;
+  --eleg-pill: linear-gradient(90deg, #ffffff1c, #ffffff0a);
+  --eleg-on-pill: #ffffff;
+  --eleg-pill-shadow: inset 0 1px #ffffff2e, inset 0 0 0 1px #ffffff1f;
+  --eleg-float: #1c1d24;
+  --eleg-pop: 0 24px 60px -18px #000000cc, 0 0 0 1px #ffffff1a;
+  --eleg-logo: #c9cbff;
+  --eleg-on-logo: #15161c;
+}
+
+.eleg-i { width: 18px; height: 18px; flex: none; }
+
+/* El vidrio con borde que brilla (como Flowly), en todas las piezas */
+.eleg-dock, .eleg-tabs, .eleg-cb {
+  position: relative;
+  background: var(--eleg-glass);
+  border: 1px solid var(--eleg-rim);
+  box-shadow: var(--eleg-shadow);
+  -webkit-backdrop-filter: var(--eleg-blur);
+  backdrop-filter: var(--eleg-blur);
+}
+:root:not([data-theme="dark"]) .eleg-dock::before,
+:root:not([data-theme="dark"]) .eleg-tabs::before,
+:root:not([data-theme="dark"]) .eleg-cb::before {
+  content: ""; position: absolute; inset: -1px; border-radius: inherit; padding: 1.5px; pointer-events: none;
+  background: linear-gradient(140deg, #fff 0%, #ffffffa6 20%, #ffffff1f 50%, #ffffff47 78%, #ffffffd9 100%);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor; mask-composite: exclude;
+}
+
+/* ── Barra lateral (pastilla flotante) ── */
+.eleg-dock-lugar {
+  position: sticky; top: var(--faixas-de-cima, 0px); z-index: 30;
+  height: calc(100dvh - var(--faixas-de-cima, 0px));
+  width: 110px; padding-left: 20px;
+  display: flex; align-items: center;
+  transition: width .25s cubic-bezier(.2, .8, .2, 1);
+}
+.eleg-dock-lugar.abierta { width: 292px; }
+.eleg-dock {
+  width: 62px; max-height: calc(100dvh - 40px);
+  border-radius: 999px; padding: 8px;
+  display: flex; flex-direction: column; gap: 4px;
+  color: var(--eleg-text);
+  transition: width .25s cubic-bezier(.2, .8, .2, 1), border-radius .25s;
+}
+.eleg-dock.abierta { width: 244px; border-radius: 28px; }
+.eleg-scroll { display: flex; flex-direction: column; gap: 2px; overflow-y: auto; overflow-x: hidden; scrollbar-width: none; }
+.eleg-scroll::-webkit-scrollbar { display: none; }
+.eleg-sep { height: 1px; background: var(--eleg-line); margin: 4px 10px; flex: none; }
+.eleg-db {
+  position: relative; display: flex; align-items: center; gap: 12px;
+  height: 44px; min-width: 44px; border-radius: 999px; padding: 0 13px;
+  opacity: .74; white-space: nowrap; color: inherit; background: none; border: 0; cursor: pointer;
+  text-align: left; width: 100%;
+}
+.eleg-db:hover, .eleg-db.on { opacity: 1; background: var(--eleg-well); }
+.eleg-dock .eleg-db.on { box-shadow: var(--eleg-pill-shadow); }
+.eleg-lb { display: none; font-weight: 600; font-size: 14px; }
+.eleg-ct { display: none; margin-left: auto; font-size: 11.5px; font-weight: 700; background: #e0563f; color: #fff; padding: 1px 8px; border-radius: 99px; }
+.eleg-tip {
+  position: absolute; left: calc(100% + 14px); top: 0; bottom: 0; margin: auto 0; height: fit-content;
+  background: var(--eleg-float); color: var(--eleg-text); box-shadow: var(--eleg-pop);
+  padding: 6px 10px; border-radius: 10px; font-size: 12.5px; font-weight: 600;
+  opacity: 0; pointer-events: none; transition: opacity .18s; white-space: nowrap; z-index: 40;
+}
+.eleg-db:hover .eleg-tip { opacity: 1; }
+.eleg-dock.abierta .eleg-lb { display: block; }
+.eleg-dock.abierta .eleg-ct { display: inline-block; }
+.eleg-dock.abierta .eleg-tip { display: none; }
+
+/* ── Barra superior ── */
+.eleg-top {
+  position: relative; z-index: 20;
+  display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 16px;
+  padding: 18px clamp(16px, 1.6vw, 28px) 4px 8px;
+  color: var(--eleg-text);
+}
+.eleg-marca {
+  display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 20px; letter-spacing: -.2px;
+  color: var(--eleg-text); background: none; border: 0; cursor: pointer; justify-self: start; min-width: 0;
+}
+.eleg-marca-nombre { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.eleg-logo { width: 42px; height: 42px; border-radius: 13px; background: var(--eleg-logo); color: var(--eleg-on-logo); display: grid; place-items: center; flex: none; }
+.eleg-logo .eleg-i { width: 19px; height: 19px; }
+/* Logo propio de Elegancia de Amor: mismo tamaño, sin el cuadrado de fondo. */
+.eleg-logo:has(.eleg-logo-img) { background: none; }
+.eleg-logo-img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.eleg-tabs { display: flex; gap: 2px; padding: 4px; border-radius: 999px; overflow-x: auto; scrollbar-width: none; }
+.eleg-tabs::-webkit-scrollbar { display: none; }
+.eleg-tabs a { position: relative; z-index: 1; padding: 10px 17px; border-radius: 999px; font-size: 13.5px; font-weight: 600; white-space: nowrap; display: flex; align-items: center; gap: 6px; color: var(--eleg-text); }
+.eleg-tabs a.on { background: var(--eleg-pill); color: var(--eleg-on-pill); box-shadow: var(--eleg-pill-shadow); }
+.eleg-tabs a b { font-size: 10.5px; background: #e0563f; color: #fff; padding: 1px 7px; border-radius: 99px; }
+.eleg-acts { display: flex; justify-content: flex-end; align-items: center; gap: 10px; }
+.eleg-cb { width: 46px; height: 46px; border-radius: 50%; display: grid; place-items: center; color: var(--eleg-text); flex: none; }
+.eleg-punto { position: absolute; top: 10px; right: 11px; width: 8px; height: 8px; border-radius: 50%; background: #e0563f; box-shadow: 0 0 0 2px var(--eleg-float); }
+/* Del menú de la persona solo queda el avatar (el tema vive en la barra lateral). */
+.eleg-usuario > div > :not(:last-child) { display: none !important; }
+.eleg-usuario button { width: 46px; height: 46px; border-radius: 50%; }
+.eleg-usuario [data-slot="avatar"], .eleg-usuario span[class*="rounded-full"] { width: 46px; height: 46px; }
+
+@media (max-width: 767px) {
+  .eleg-top { grid-template-columns: 1fr auto; padding: 12px 16px 4px; }
+  .eleg-tabs { grid-column: 1 / -1; order: 3; }
+}
+
+/* ── Resumen del prototipo: números, gráfica, dona y tarjetas ── */
+.eleg-big { font-size: clamp(32px, 3vw, 46px); font-weight: 600; letter-spacing: -.03em; line-height: 1; color: var(--eleg-text); }
+.eleg-malo { color: #b8401f; }
+.eleg-bueno { color: #3c7a14; }
+[data-theme="dark"] .eleg-malo { color: #ff8a8a; }
+[data-theme="dark"] .eleg-bueno { color: #6fdc9a; }
+[data-theme="dark"] .eleg-big { text-shadow: 0 0 24px #c9cbff40; }
+.eleg-grafico text, .eleg-dona text { font-size: 11px; fill: var(--color-text-subtle, #6b726d); }
+.eleg-rejilla { stroke: var(--eleg-line); }
+.eleg-area { fill: #f27d5f; opacity: .14; }
+.eleg-linea { stroke: #f27d5f; }
+.eleg-ley { width: 9px; height: 9px; border-radius: 50%; background: #f27d5f; flex: none; }
+[data-theme="dark"] .eleg-linea { stroke: #fff; filter: drop-shadow(0 0 4px #c9cbffcc) drop-shadow(0 0 10px #8f92ff88); }
+[data-theme="dark"] .eleg-area { fill: #8f92ff; opacity: .16; }
+[data-theme="dark"] .eleg-ley { background: #fff; box-shadow: 0 0 8px #c9cbff; }
+.eleg-dona-fondo { stroke: var(--eleg-well); }
+.eleg-dona .eleg-dona-pct { font-size: 30px; font-weight: 600; fill: var(--eleg-text); }
+.eleg-si { width: 46px; height: 46px; border-radius: 50%; display: grid; place-items: center; background: var(--eleg-glass); border: 1px solid var(--eleg-rim); -webkit-backdrop-filter: var(--eleg-blur); backdrop-filter: var(--eleg-blur); color: var(--eleg-text); flex: none; }
+.eleg-badge { font-size: 11.5px; font-weight: 700; padding: 3px 9px; border-radius: 99px; background: var(--eleg-logo); color: var(--eleg-on-logo); }
+.eleg-badge.celeste { background: #8cc4ff; color: #13171a; }
+.eleg-ib { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; border: 1px solid var(--eleg-line); color: var(--eleg-text); }
+.eleg-chip { font-size: 11.5px; font-weight: 600; padding: 4px 10px; border-radius: 99px; background: var(--eleg-well); white-space: nowrap; flex: none; }
+.eleg-av { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; font-size: 12px; font-weight: 700; flex: none; color: #13171a; }
+.eleg-tile { display: block; border-radius: 18px; padding: 14px; background: var(--bgc); color: #13171a; }
+.eleg-tile.ink { color: #f2f4f0; }
+.eleg-tile .d { font-size: 12px; opacity: .72; font-weight: 600; }
+.eleg-tile .n { font-size: 15px; font-weight: 600; margin: 6px 0 2px; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.eleg-tile .v { font-size: 19px; font-weight: 700; margin-top: 10px; display: flex; justify-content: space-between; align-items: center; }
+.eleg-tile .v span { font-size: 11px; font-weight: 600; opacity: .75; }
+[data-theme="dark"] .eleg-tile { background: linear-gradient(180deg, #ffffff0f, #ffffff05), #1a1b22; color: var(--eleg-text); border: 1px solid #ffffff17; box-shadow: inset 3px 0 0 var(--punto), inset 0 1px #ffffff1a; }
+/* Avatar de la persona con el acento (como el prototipo) */
+.eleg-usuario span[class*="rounded-full"] { background: var(--eleg-logo); color: var(--eleg-on-logo); font-weight: 700; }
+
+/* ── Gráfica interactiva de gasto ── */
+.eleg-grafico-caja { position: relative; }
+.eleg-grafico { cursor: crosshair; overflow: visible; }
+.eleg-area { fill: url(#eleg-area-grad); opacity: 1; }
+.eleg-area-tope { stop-color: #f27d5f; stop-opacity: .28; }
+.eleg-area-base { stop-color: #f27d5f; stop-opacity: 0; }
+[data-theme="dark"] .eleg-area { fill: url(#eleg-area-grad); opacity: 1; }
+[data-theme="dark"] .eleg-area-tope { stop-color: #8f92ff; stop-opacity: .35; }
+[data-theme="dark"] .eleg-area-base { stop-color: #8f92ff; stop-opacity: 0; }
+.eleg-linea-anim { stroke-dasharray: 1; stroke-dashoffset: 1; animation: eleg-dibujar 1.4s cubic-bezier(.2, .8, .2, 1) .1s forwards; }
+.eleg-area-anim { opacity: 0; animation: eleg-aparecer .9s ease .6s forwards; }
+@keyframes eleg-dibujar { to { stroke-dashoffset: 0; } }
+@keyframes eleg-aparecer { to { opacity: 1; } }
+.eleg-guia { stroke: var(--eleg-text); opacity: .35; }
+.eleg-halo { fill: #f27d5f; opacity: .22; animation: eleg-latido 1.6s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
+.eleg-punto-dia { fill: #fff; stroke: #f27d5f; stroke-width: 2.4; }
+[data-theme="dark"] .eleg-halo { fill: #c9cbff; opacity: .3; }
+[data-theme="dark"] .eleg-punto-dia { fill: #fff; stroke: #c9cbff; filter: drop-shadow(0 0 6px #c9cbff); }
+@keyframes eleg-latido { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.5); } }
+.eleg-marca-dia circle, .eleg-marca-dia line { transition: cx .12s ease, cy .12s ease, x1 .12s ease, x2 .12s ease; }
+.eleg-eje-on { fill: var(--eleg-text) !important; font-weight: 700; }
+.eleg-burbuja {
+  position: absolute; transform: translate(-50%, calc(-100% - 36px)); pointer-events: none;
+  display: flex; flex-direction: column; align-items: center; gap: 1px;
+  padding: 7px 12px; border-radius: 12px; white-space: nowrap;
+  background: var(--eleg-float); color: var(--eleg-text); box-shadow: var(--eleg-pop);
+  border: 1px solid var(--eleg-rim); transition: left .12s ease, top .12s ease;
+}
+.eleg-burbuja b { font-size: 15px; font-weight: 700; }
+.eleg-burbuja span { font-size: 11.5px; opacity: .7; }
+[data-theme="dark"] .eleg-burbuja { background: #1e2030e6; -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); box-shadow: 0 10px 30px -10px #000, 0 0 18px -6px #8f92ffaa; }
+@media (prefers-reduced-motion: reduce) { .eleg-linea-anim, .eleg-area-anim, .eleg-halo { animation: none; stroke-dashoffset: 0; opacity: 1; } }
+
+/* Gráfica: ventas y etiqueta con Ganado/Gastado (como la referencia) */
+.eleg-ley-ganado { background: #3c7a14 !important; box-shadow: none !important; }
+[data-theme="dark"] .eleg-ley-ganado { background: #6fdc9a !important; }
+.eleg-venta { fill: #3c7a14; stroke: var(--eleg-float); stroke-width: 2; }
+[data-theme="dark"] .eleg-venta { fill: #6fdc9a; filter: drop-shadow(0 0 5px #6fdc9a); }
+.eleg-guia { stroke: var(--eleg-text); opacity: .28; stroke-dasharray: none; }
+.eleg-burbuja { align-items: stretch; gap: 6px; padding: 12px 14px; border-radius: 14px; min-width: 190px; }
+.eleg-burbuja-fecha { font-size: 14px; font-weight: 700; text-transform: capitalize; margin-bottom: 2px; }
+.eleg-burbuja-fila { display: flex; align-items: center; gap: 8px; font-size: 13.5px; }
+.eleg-burbuja-fila b { margin-left: auto; padding-left: 16px; font-size: 14px; font-weight: 700; }
+
+/* ── CELULAR: barra de abajo, panel "Más" y barra de arriba ── */
+.eleg-barra {
+  position: fixed; left: 0; right: 0; z-index: 40;
+  padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px));
+  background: var(--eleg-glass); border-top: 1px solid var(--eleg-rim);
+  -webkit-backdrop-filter: var(--eleg-blur); backdrop-filter: var(--eleg-blur);
+  box-shadow: 0 -12px 30px -18px #1e283c4d, inset 0 1px 0 #ffffff59;
+}
+[data-theme="dark"] .eleg-barra { box-shadow: 0 -16px 36px -16px #000000cc, inset 0 1px 0 #ffffff1f; }
+.eleg-barra ul { display: flex; gap: 4px; list-style: none; margin: 0; padding: 0; }
+.eleg-barra li { flex: 1; min-width: 0; display: flex; }
+.eleg-barra-item {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px;
+  padding: 7px 2px 6px; border-radius: 16px; color: var(--eleg-text); opacity: .7;
+  background: none; border: 0; font: inherit;
+}
+.eleg-barra-item.on { opacity: 1; background: var(--eleg-pill); color: var(--eleg-on-pill); box-shadow: var(--eleg-pill-shadow); }
+.eleg-barra-ico { position: relative; display: grid; place-items: center; }
+.eleg-barra-ico .eleg-i { width: 21px; height: 21px; }
+.eleg-barra-lb { font-size: 11px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.eleg-barra-ct { position: absolute; top: -7px; left: 13px; font-size: 9.5px; font-weight: 700; background: #e0563f; color: #fff; padding: 0 5px; border-radius: 99px; line-height: 15px; }
+
+.eleg-mas {
+  background: var(--eleg-glass) !important; border: 1px solid var(--eleg-rim) !important;
+  -webkit-backdrop-filter: var(--eleg-blur); backdrop-filter: var(--eleg-blur);
+  border-radius: 28px 28px 0 0; padding: 20px 16px calc(24px + env(safe-area-inset-bottom, 0px)) !important;
+  color: var(--eleg-text);
+}
+[data-theme="dark"] .eleg-mas { background: radial-gradient(120% 90% at 85% 115%, #7a7cc94d, #0000 60%), #15161bf2 !important; }
+.eleg-mas-titulo { font-size: 13px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; opacity: .6; margin: 0 4px 14px; }
+.eleg-mas-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.eleg-mas-item {
+  display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center;
+  padding: 16px 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 600; color: var(--eleg-text);
+  background: var(--eleg-well); border: 1px solid var(--eleg-rim); font-family: inherit;
+}
+.eleg-mas-item.on { background: var(--eleg-pill); color: var(--eleg-on-pill); }
+.eleg-mas-ico { width: 44px; height: 44px; border-radius: 50%; display: grid; place-items: center; background: var(--eleg-glass); border: 1px solid var(--eleg-rim); }
+.eleg-mas-item.on .eleg-mas-ico { background: #ffffff1f; }
+.eleg-mas-ico .eleg-i { width: 20px; height: 20px; }
+
+@media (max-width: 767px) {
+  .eleg-top { grid-template-columns: 1fr auto; gap: 10px; padding: 12px 14px 4px; }
+  .eleg-tabs, .eleg-solo-pc { display: none !important; }
+  .eleg-marca { font-size: 18px; gap: 10px; }
+  .eleg-logo { width: 38px; height: 38px; border-radius: 12px; }
+  .eleg-acts { gap: 8px; }
+  .eleg-cb, .eleg-usuario button { width: 40px; height: 40px; }
+}
+
+/* ── Embudo en el celular: directo a los pedidos ── */
+@media (max-width: 767px) {
+  body:has([data-marca-org][data-aparencia="elegancia"]) .eleg-ctl-funil,
+  body:has([data-marca-org][data-aparencia="elegancia"]) .eleg-filtros-funil { display: none !important; }
+  body:has([data-marca-org][data-aparencia="elegancia"]) .eleg-eventos {
+    flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; margin: 0 -16px; padding: 2px 16px 4px;
+  }
+  body:has([data-marca-org][data-aparencia="elegancia"]) .eleg-eventos::-webkit-scrollbar { display: none; }
+  body:has([data-marca-org][data-aparencia="elegancia"]) .eleg-eventos > button {
+    height: 36px; padding: 0 12px 0 4px; font-size: 13px; gap: 6px;
+  }
+  body:has([data-marca-org][data-aparencia="elegancia"]) .eleg-eventos > button > span:first-child {
+    width: 26px; height: 26px; font-size: 10px;
+  }
+}
+
+/* ── Configuración: pestañas por área y cuadritos compactos ── */
+.eleg-config-tabs {
+  display: flex; gap: 2px; padding: 4px; border-radius: 999px; overflow-x: auto; scrollbar-width: none; align-self: flex-start; max-width: 100%;
+  background: var(--eleg-glass); border: 1px solid var(--eleg-rim); box-shadow: var(--eleg-shadow);
+  -webkit-backdrop-filter: var(--eleg-blur); backdrop-filter: var(--eleg-blur);
+}
+.eleg-config-tabs::-webkit-scrollbar { display: none; }
+.eleg-config-tabs a { padding: 9px 16px; border-radius: 999px; font-size: 13.5px; font-weight: 600; white-space: nowrap; color: var(--eleg-text); }
+.eleg-config-tabs a.on { background: var(--eleg-pill); color: var(--eleg-on-pill); box-shadow: var(--eleg-pill-shadow); }
+.eleg-config-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+.eleg-config-item {
+  display: flex; align-items: center; gap: 11px; padding: 10px 12px; border-radius: 16px; min-width: 0;
+  background: var(--eleg-glass); border: 1px solid var(--eleg-rim); color: var(--eleg-text);
+  -webkit-backdrop-filter: var(--eleg-blur); backdrop-filter: var(--eleg-blur);
+  transition: transform .12s ease, box-shadow .12s ease;
+}
+.eleg-config-item:hover { transform: translateY(-1px); box-shadow: var(--eleg-pop); }
+.eleg-config-ico { width: 36px; height: 36px; border-radius: 11px; display: grid; place-items: center; flex: none; background: var(--eleg-well); }
+.eleg-config-nombre { font-size: 13.5px; font-weight: 600; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+@media (max-width: 767px) {
+  .eleg-config-tabs { margin: 0 -14px; padding: 4px; border-radius: 0; border-left: 0; border-right: 0; align-self: stretch; }
+  .eleg-config-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .eleg-config-item { padding: 9px 10px; gap: 9px; }
+  .eleg-config-ico { width: 32px; height: 32px; }
+  .eleg-config-nombre { font-size: 12.5px; }
+}
+
+/* ── BANDEJA: limpia (filtros plegados, selección con toque largo, botón con color) ── */
+.eleg-inbox-filtros-boton { display: none; }
+body:has([data-marca-org][data-aparencia="elegancia"]) .eleg-iniciar {
+  background: var(--color-accent, #13171a); color: var(--color-accent-foreground, #fff);
+  border-color: transparent; font-weight: 600; border-radius: 999px;
+  box-shadow: 0 8px 20px -10px #13171a99;
+}
+body:has([data-marca-org][data-aparencia="elegancia"]) .eleg-iniciar:hover { filter: brightness(1.12); }
+[data-theme="dark"] body:has([data-marca-org][data-aparencia="elegancia"]) .eleg-iniciar,
+body:has([data-marca-org][data-aparencia="elegancia"])[data-theme="dark"] .eleg-iniciar { box-shadow: 0 8px 22px -10px #000; }
+/* Casillas solo cuando ya se empezó a seleccionar (toque largo sobre una conversación). */
+body:has([data-marca-org][data-aparencia="elegancia"]):not(:has(.eleg-sel-caja[aria-checked="true"])) .eleg-sel-caja,
+body:has([data-marca-org][data-aparencia="elegancia"]):not(:has(.eleg-sel-caja[aria-checked="true"])) .eleg-sel-todas { display: none !important; }
+@media (max-width: 767px) {
+  body:has([data-marca-org][data-aparencia="elegancia"]) .eleg-inbox-filtros-boton {
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+    width: calc(100% - 24px); margin: 10px 12px 2px; height: 34px; border-radius: 999px;
+    font-size: 13px; font-weight: 600; color: var(--eleg-text, inherit);
+    background: var(--eleg-well, transparent); border: 1px solid var(--eleg-rim, var(--color-border));
+  }
+  body:has([data-marca-org][data-aparencia="elegancia"]) .eleg-inbox-filtros:not([data-abierto]) { display: none !important; }
+  /* Iniciar conversación: botón redondo flotante, dentro de la Bandeja. */
+  body:has([data-marca-org][data-aparencia="elegancia"]) .eleg-iniciar-caja { padding: 0; height: 0; }
+  body:has([data-marca-org][data-aparencia="elegancia"]) .eleg-iniciar {
+    position: fixed; right: 16px; bottom: calc(88px + env(safe-area-inset-bottom, 0px)); z-index: 41;
+    width: 56px; height: 56px; padding: 0; border-radius: 999px;
+    box-shadow: 0 12px 28px -8px #13171ab3;
+  }
+  body:has([data-marca-org][data-aparencia="elegancia"]) .eleg-iniciar svg { width: 24px; height: 24px; }
+  body:has([data-marca-org][data-aparencia="elegancia"]) .eleg-iniciar-texto { display: none; }
+}
+
+/* ── MÁS › Buscar: encontrar a una clienta y abrir su chat ── */
+.eleg-buscar { display: flex; flex-direction: column; gap: 10px; min-height: 46vh; }
+.eleg-buscar-campo {
+  display: flex; align-items: center; gap: 10px; height: 46px; padding: 0 14px; border-radius: 999px;
+  background: var(--eleg-glass); border: 1px solid var(--eleg-rim); color: var(--eleg-text);
+}
+.eleg-buscar-campo .eleg-i { width: 19px; height: 19px; opacity: .6; flex: none; }
+.eleg-buscar-campo input { flex: 1; min-width: 0; background: transparent; border: 0; outline: 0; font-size: 16px; color: inherit; }
+.eleg-buscar-lista { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; max-height: 52vh; overflow-y: auto; }
+.eleg-buscar-lista button {
+  width: 100%; display: flex; align-items: center; gap: 11px; padding: 9px 12px; border-radius: 16px; text-align: left;
+  background: var(--eleg-glass); border: 1px solid var(--eleg-rim); color: var(--eleg-text);
+}
+.eleg-buscar-ini { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; flex: none; font-weight: 700; font-size: 14px; background: var(--eleg-well); }
+.eleg-buscar-txt { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.eleg-buscar-txt b { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.eleg-buscar-txt small { font-size: 12px; opacity: .6; }
+.eleg-buscar-vacio { text-align: center; font-size: 13px; opacity: .6; padding: 10px; }

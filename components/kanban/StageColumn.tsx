@@ -1,0 +1,550 @@
+"use client";
+import { Droppable } from "@hello-pangea/dnd";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useT } from "@/hooks/i18n/useT";
+import { cn } from "@/lib/utils";
+import type { Lead } from "@/lib/types/leads";
+import type { Stage } from "@/lib/kanban/types";
+import { intervaloDaColuna } from "@/lib/kanban/selecao";
+import { CARDS_POR_VEZ, cardsVisiveisDaColuna, colunaLimitada, limiteQueMostra } from "@/lib/kanban/limite-da-coluna";
+import { formatSomaPorMoeda, formatValorDoNegocio, MOEDA_PADRAO, somaPorMoeda } from "@/lib/money";
+import type { GestoDeSelecao } from "./KanbanCard";
+import { CardsDaColuna } from "./CardsDaColuna";
+import { bordaDaColuna, fundoDaColuna } from "@/lib/kanban/cor-da-coluna";
+import { PencilSimple } from "@/lib/ui/icons";
+
+interface StageColumnProps {
+  stage: Stage;
+  leads: Lead[];
+  pipelineId: string;
+  /** owner_user_id → nome, resolvido no board. O dono agente vem no lead. */
+  ownerNames?: Map<string, string | null>;
+  /** ids que o radar classificou como esfriando (fonte única, não recalculada). */
+  coolingIds?: Set<string>;
+  /** Propostas de retomada vivas, por lead. */
+  reactivations?: Map<string, { proposalId: string; expiresAt: string }>;
+  /** `settings.canonical_tags` do pipeline — a única tag que fica no card. */
+  canonicalTags?: string[];
+  selectedLeadIds?: Set<string>;
+  /** leadId → quantos eventos remotos já chegaram (muda = pulsa de novo). */
+  pulses?: Map<string, number>;
+  /**
+   * Marca/desmarca um conjunto de uma vez — a etapa inteira, ou o intervalo do
+   * shift+clique. Existe separado de `onSelect` porque a coluna é a única que
+   * sabe a ordem VISÍVEL dos cards (é ela que recebe a lista já filtrada), e
+   * resolver o intervalo no board significaria reconstruir essa ordem lá.
+   */
+  onSelectMany?: (leadIds: string[], marcar: boolean) => void;
+  /** Abrir o dossiê — atravessa o board até o card, como `pulses`. */
+  onOpen?: (leadId: string) => void;
+  /** "Mover para…" do menu do card — atravessa a coluna como `onOpen`. */
+  etapas?: Stage[];
+  onMoverPara?: (lead: Lead, stageId: string) => void;
+  /** `manager`+ — mesmo corte de papel da rota que renomeia a etapa. */
+  podeRenomear?: boolean;
+  onRenomear?: (nome: string) => void;
+  /**
+   * Cards que aparecem mesmo além do corte de ganho/perda (#4788): o último
+   * solto pelo arraste e o do dossiê aberto (`?lead=`). Ver
+   * `lib/kanban/limite-da-coluna.ts`.
+   */
+  soltoId?: string | null;
+  abertoId?: string | null;
+  /** Densidade dos cards (issue #3461, item 2) — atravessa como `pulses`. */
+  denso?: boolean;
+  /**
+   * Quadro de um funil ARQUIVADO (#1298): abre para OLHAR, e nada aqui grava.
+   * Sem arraste, sem menu de ações de card, sem seleção (a barra em lote é
+   * escrita) e sem abrir o dossiê, que tem ações próprias.
+   */
+  somenteLeitura?: boolean;
+  /**
+   * A cor da etapa pinta a COLUNA em tom pastel (preferência de quem olha, no
+   * navegador). Desligado, a cor fica só na bolinha do cabeçalho, como sempre foi.
+   */
+  corNaColuna?: boolean;
+}
+
+export function StageColumn({
+  stage,
+  leads,
+  pipelineId,
+  ownerNames,
+  coolingIds,
+  reactivations,
+  canonicalTags,
+  selectedLeadIds,
+  pulses,
+  onSelectMany,
+  onOpen,
+  etapas,
+  onMoverPara,
+  podeRenomear = false,
+  onRenomear,
+  soltoId = null,
+  abertoId = null,
+  denso = false,
+  somenteLeitura = false,
+  corNaColuna = false,
+}: StageColumnProps) {
+  const t = useT();
+  // O TOTAL É POR MOEDA (#1531). Antes ele somava todos os `value_cents` e
+  // escrevia o resultado na moeda do primeiro negócio: R$ 5.000 e 5.000 € saíam
+  // "R$ 10.000,00", um valor que não existe. Agora cada moeda tem o seu total,
+  // lado a lado e sem conversão ("R$ 5.000,00 + 5000,00 €"). Com uma moeda só o
+  // texto é exatamente o de antes — é o caso comum, e nele nada muda. (Antes
+  // disso, o total saía SEMPRE em R$ por um `formatBRL` local com a moeda em
+  // duro; `formatValorDoNegocio` é a fonte única e a régua ×100 do negócio.)
+  //
+  // `currency` NULL conta como `MOEDA_PADRAO`, porque é o que o card mostra
+  // (`KanbanCard`): o total não pode discordar do card que está logo abaixo.
+  const moedaDoLead = (l: Lead) => l.currency ?? MOEDA_PADRAO;
+  const totais = somaPorMoeda(leads, (l) => l.value_cents, moedaDoLead);
+  // A ordem: primeiro a moeda com MAIS NEGÓCIOS COM VALOR na coluna (empate em
+  // ordem alfabética), depois as demais em ordem alfabética. Conta negócios, não
+  // soma valores — "mais valor" compararia centavos de moedas diferentes, o
+  // mesmo erro que esta regra acaba. E não depende da posição dos cards: mover
+  // um card na coluna não embaralha o cabeçalho.
+  //
+  // ponytail: o ideal é a moeda da ORGANIZAÇÃO primeiro, mas ela não chega ao
+  // quadro (`ActiveOrg` traz o fuso e não a moeda). Como o negócio nasce na
+  // moeda da organização (API e conversa), a mais frequente é, na prática, ela;
+  // numa organização anterior a isso, os negócios antigos em BRL podem ganhar.
+  // Upgrade: `currency` no embed `organizations(...)` de `lib/auth/server.ts`,
+  // em `ActiveOrg`, e daí page → `PipelinePageClient` → `KanbanBoard` → uma prop
+  // aqui que substitui `primeira`.
+  const primeira = [
+    ...somaPorMoeda(leads, (l) => (l.value_cents == null ? null : 1), moedaDoLead),
+  ].sort(([ma, na], [mb, nb]) => nb - na || ma.localeCompare(mb))[0]?.[0];
+  // A faixa aparece quando alguma moeda soma mais de zero — o `total > 0` de
+  // antes, por moeda. Coluna sem valor nenhum não mostra "R$ 0,00".
+  const temTotal = [...totais.values()].some((cents) => cents > 0);
+
+  // A linha "ponderado" (issue #1535): o que ESTA coluna representa quando a
+  // etapa tem chance calibrada. Ganho e perda valem 100 e 0 NA REGRA
+  // (`lib/leads/previsao.ts`), não na coluna. `null` = etapa sem calibração, e
+  // aí a linha não aparece: exibir "R$ 0,00" seria um número que ninguém
+  // calibrou lendo como uma promessa de zero.
+  //
+  // Também por moeda, com a mesma função de moeda e a mesma `primeira` do total:
+  // mesmas moedas, na mesma ordem. Arredonda por negócio, como antes.
+  const probDaColuna = stage.is_won ? 100 : stage.is_lost ? 0 : (stage.win_probability ?? null);
+  const ponderados =
+    probDaColuna === null
+      ? null
+      : somaPorMoeda(
+          leads,
+          (l) => (l.value_cents == null ? null : Math.round((l.value_cents * probDaColuna) / 100)),
+          moedaDoLead,
+        );
+
+  // Elegancia: tocar el nombre de la columna la ordena por lo MÁS RECIENTE
+  // (quien escribió último arriba). La elección queda guardada en este aparato.
+  const claveDeOrden = `eleg-orden:${stage.id}`;
+  const [porReciente, setPorReciente] = useState(false);
+  useEffect(() => {
+    try {
+      setPorReciente(localStorage.getItem(claveDeOrden) === "reciente");
+    } catch {
+      /* sin almacenamiento */
+    }
+  }, [claveDeOrden]);
+  const alternarOrden = () =>
+    setPorReciente((v) => {
+      const nuevo = !v;
+      try {
+        if (nuevo) localStorage.setItem(claveDeOrden, "reciente");
+        else localStorage.removeItem(claveDeOrden);
+      } catch {
+        /* sin almacenamiento */
+      }
+      return nuevo;
+    });
+  const ordenados = useMemo(() => {
+    if (!porReciente) return leads;
+    const fecha = (l: Lead) =>
+      Date.parse(l.conversa?.last_message_at ?? l.last_activity_at ?? l.updated_at ?? l.created_at) || 0;
+    return [...leads].sort((a, b) => fecha(b) - fecha(a));
+  }, [leads, porReciente]);
+
+  const idsVisiveis = useMemo(() => ordenados.map((l) => l.id), [ordenados]);
+  const selecionadosAqui = idsVisiveis.filter((id) => selectedLeadIds?.has(id)).length;
+  const todosSelecionados = idsVisiveis.length > 0 && selecionadosAqui === idsVisiveis.length;
+
+  // Ganho e perda desenham 50 por vez (#4788); o contador, os totais e
+  // "selecionar a etapa" acima seguem com todos (`lib/kanban/limite-da-coluna.ts`).
+  // O ajuste do limite é no render, sem um quadro intermediário sem o card.
+  const [limite, setLimite] = useState(CARDS_POR_VEZ);
+  const limitada = colunaLimitada(stage);
+  const necessario = limiteQueMostra(ordenados, { limitada, limite, fixos: [soltoId, abertoId] });
+  if (necessario > limite) setLimite(necessario);
+  const mostrados = useMemo(
+    () => cardsVisiveisDaColuna(ordenados, { limitada, limite: necessario }),
+    [ordenados, limitada, necessario],
+  );
+  const escondidos = leads.length - mostrados.length;
+
+  // A âncora do shift+clique. `useRef` e não `useState` de propósito: mudar a
+  // âncora não muda nada na tela, e um `setState` aqui remontaria a coluna
+  // inteira — inclusive o `Droppable` — a cada card marcado.
+  const ancora = useRef<string | null>(null);
+  // A ordem e a seleção chegam ao `aoSelecionar` por ref (#4788): com elas nas
+  // dependências, marcar ou mover um card trocava a função que todos os cards
+  // recebem, e a coluna inteira redesenhava.
+  const idsAtuais = useRef(idsVisiveis);
+  const selecaoAtual = useRef(selectedLeadIds);
+  useEffect(() => {
+    idsAtuais.current = idsVisiveis;
+    selecaoAtual.current = selectedLeadIds;
+  }, [idsVisiveis, selectedLeadIds]);
+
+  const aoSelecionar = useCallback(
+    (leadId: string, gesto: GestoDeSelecao) => {
+      if (gesto === "intervalo") {
+        const faixa = intervaloDaColuna(idsAtuais.current, ancora.current, leadId);
+        ancora.current = leadId;
+        onSelectMany?.(faixa, true);
+        return;
+      }
+      ancora.current = leadId;
+      onSelectMany?.([leadId], !selecaoAtual.current?.has(leadId));
+    },
+    [onSelectMany],
+  );
+
+  const alternarEtapa = () => {
+    ancora.current = null;
+    onSelectMany?.(idsVisiveis, !todosSelecionados);
+  };
+  const accentStyle: CSSProperties | undefined = stage.color
+    ? { backgroundColor: stage.color }
+    : undefined;
+
+  return (
+    <div
+      /*
+        `w-[85vw] max-w-80 snap-center md:w-80` — a coluna cabe na tela do
+        celular, e uma por vez.
+
+        Com `w-80` fixo (320px) numa tela de 360px a coluna ocupava 89% da
+        largura útil e a de ao lado aparecia como uma fatia de poucos pixels: um
+        quadro que parece CORTADO em vez de rolável, sem pista de que há mais
+        etapa adiante. 85vw deixa uma sobra, que é onde a coluna seguinte se
+        anuncia — e `snap-center` faz a rolagem parar nela em vez de deixar o
+        dedo no meio de duas.
+
+        `max-w-80` segura o crescimento no tablet: 85% de 1023px seriam 870px, e
+        coluna de etapa não vira painel. De `md` para cima volta o `w-80` de
+        sempre, onde a graça é justamente ver várias etapas ao mesmo tempo.
+      */
+      className="bg-surface-elevated/40 flex min-h-full w-[85vw] max-w-80 shrink-0 snap-center flex-col rounded-lg border border-border md:w-80"
+      // Com `corNaColuna`, a cor da etapa pinta a coluna em tom pastel (a bolinha continua).
+      style={corNaColuna ? { ...fundoDaColuna(stage.color), ...bordaDaColuna(stage.color) } : undefined}
+      data-etapa-do-quadro={stage.id}
+    >
+      {/* Cabeçalho e total PRESOS no alto do quadro enquanto os cards rolam: com
+          uma etapa comprida, é o que diz em que etapa se está olhando. O fundo
+          opaco (`bg-background`) é o que impede os cards de aparecerem por baixo;
+          por dentro, a mesma camada translúcida da coluna, para o tom não mudar.
+
+          A BORDA DE CIMA É DO CABEÇALHO, não da coluna (#3030): a coluna tem
+          `border` e o cabeçalho `sticky top-0`, então ao rolar a borda da coluna
+          saía da tela e o cabeçalho ficava solto, sem contorno em cima. Com
+          `border-x border-t` aqui e `-mx-px -mt-px` (1px para cima e para os
+          lados), o contorno de cima cobre exatamente a borda da coluna e viaja
+          junto com o cabeçalho preso. */}
+      <div
+        className="sticky top-0 z-10 -mx-px -mt-px rounded-t-lg border-x border-t border-border bg-background"
+        style={corNaColuna ? bordaDaColuna(stage.color) : undefined}
+        data-cabecalho-da-etapa
+      >
+        <div className="bg-surface-elevated/40 rounded-t-lg" style={corNaColuna ? fundoDaColuna(stage.color) : undefined}>
+          <div className="group/etapa flex items-center gap-2 border-b border-border px-3 py-2.5">
+            {/* "Selecionar a etapa inteira" é o gesto que faz a ação em lote valer a
+            pena: sem ele, mover trinta cards deixa de ser trinta arrastes e vira
+            trinta cliques com modificador. Fica no cabeçalho porque é ali que a
+            etapa é um objeto — o mesmo lugar onde já se lê a contagem dela.
+            Indeterminado quando a seleção é parcial: "alguns" e "nenhum" não
+            podem ter a mesma aparência num controle que o próximo clique
+            inverte. */}
+            {!somenteLeitura && (
+              <input
+                type="checkbox"
+                checked={todosSelecionados}
+                ref={(el) => {
+                  if (el) el.indeterminate = selecionadosAqui > 0 && !todosSelecionados;
+                }}
+                disabled={idsVisiveis.length === 0}
+                onChange={alternarEtapa}
+                aria-label={
+                  todosSelecionados
+                    ? `${t("Desmarcar todos em")} ${stage.name}`
+                    : `${t("Selecionar todos em")} ${stage.name}`
+                }
+                className={cn(
+                  "h-4 w-4 shrink-0 cursor-pointer accent-accent transition-opacity",
+                  "focus:opacity-100 disabled:cursor-default",
+                  // `pointer-coarse:opacity-100` pelo mesmo motivo da caixa do
+                  // card (ver `components/kanban/KanbanCard.tsx`): no toque o
+                  // hover nunca acontece, e "selecionar a etapa inteira" é o gesto
+                  // que faz a ação em lote valer a pena. Sem ele, mover trinta
+                  // cards no celular eram trinta arrastes.
+                  selecionadosAqui > 0
+                    ? "opacity-100"
+                    : "opacity-0 group-hover/etapa:opacity-100 pointer-coarse:opacity-100",
+                )}
+              />
+            )}
+            <span
+              className={cn("h-2 w-2 rounded-full", !stage.color && "bg-text-muted/40")}
+              style={accentStyle}
+              aria-hidden
+            />
+            {/* Elegancia: tocar el nombre ordena por lo más reciente; mantenerlo
+                presionado (o el lápiz) lo renombra. */}
+            <h2 className="flex min-w-0 flex-1 items-center gap-1">
+              <NombreDeLaEtapa
+                nome={stage.name}
+                onRenomear={podeRenomear && !somenteLeitura ? onRenomear : undefined}
+                porReciente={porReciente}
+                onOrdenar={alternarOrden}
+              />
+            </h2>
+            <span className="rounded-full bg-surface px-2 py-0.5 text-[11px] font-medium text-text-muted tabular-nums">
+              {selecionadosAqui > 0 ? `${selecionadosAqui}/${leads.length}` : leads.length}
+            </span>
+          </div>
+
+          {temTotal && (
+            <div
+              className={cn(
+                "border-b border-border px-3 py-1.5 text-[11px] tabular-nums",
+                // Sobre o fundo colorido, o cinza de apoio cai abaixo de 4,5:1 no tema
+                // escuro (2,77 na etapa amarela, medido na prova do #4976): o total
+                // usa a cor de texto principal, como o nome da etapa.
+                corNaColuna && stage.color ? "text-text" : "text-text-muted",
+              )}
+            >
+              {formatSomaPorMoeda(totais, formatValorDoNegocio, { primeira })}
+              {ponderados !== null && (
+                <span className="ml-2">
+                  · {t("ponderado")}{" "}
+                  {formatSomaPorMoeda(ponderados, formatValorDoNegocio, { primeira })}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <Droppable droppableId={stage.id} type="LEAD">
+        {(provided, snapshot) => (
+          <div
+            ref={provided.innerRef}
+            {...provided.droppableProps}
+            className={cn(
+              "flex flex-1 flex-col gap-2 p-2 transition-colors",
+              snapshot.isDraggingOver && "bg-accent/5",
+            )}
+          >
+            {/* Lista memoizada (#4788): mudar `isDraggingOver` não redesenha os
+                cards; em ganho/perda, só os `mostrados`. */}
+            <CardsDaColuna
+              leads={mostrados}
+              stageName={stage.name}
+              pipelineId={pipelineId}
+              ownerNames={ownerNames}
+              coolingIds={coolingIds}
+              reactivations={reactivations}
+              canonicalTags={canonicalTags}
+              selectedLeadIds={selectedLeadIds}
+              pulses={pulses}
+              onSelect={somenteLeitura ? undefined : aoSelecionar}
+              onOpen={somenteLeitura ? undefined : onOpen}
+              etapas={etapas}
+              onMoverPara={onMoverPara}
+              denso={denso}
+              somenteLeitura={somenteLeitura}
+            />
+            {provided.placeholder}
+            {escondidos > 0 && (
+              <button
+                type="button"
+                onClick={() => setLimite((n) => n + CARDS_POR_VEZ)}
+                className="rounded-md border border-dashed border-border py-1.5 text-xs font-medium text-text-muted hover:bg-surface hover:text-text"
+                data-testid="mostrar-mais-da-coluna"
+                title={`${mostrados.length} / ${leads.length}`}
+              >
+                {t("Mostrar mais")} {Math.min(CARDS_POR_VEZ, escondidos)}
+              </button>
+            )}
+            {leads.length === 0 && !snapshot.isDraggingOver && (
+              <div className="flex h-20 items-center justify-center text-[11px] text-text-muted">
+                {t("vazio")}
+              </div>
+            )}
+          </div>
+        )}
+      </Droppable>
+    </div>
+  );
+}
+
+/**
+ * O nome da etapa, editado no lugar — direto no cabeçalho da coluna.
+ *
+ * Mesmo contrato de `NomeDaEtapa` (Configurações › Funis, que chama a MESMA
+ * rota `PATCH /api/v1/pipelines/:id/stages/:stageId`): salva ao CONFIRMAR
+ * (Enter ou sair do campo), nunca a cada tecla — um PATCH por caractere
+ * dispararia a validação de nome duplicado no meio da digitação. O rascunho é
+ * local; o `key={stage.name}` de quem chama remonta o campo quando o nome
+ * GRAVADO muda, então uma edição feita em outra aba não fica escondida atrás
+ * de um rascunho velho.
+ */
+function NombreDeLaEtapa({
+  nome,
+  onRenomear,
+  porReciente,
+  onOrdenar,
+}: {
+  nome: string;
+  onRenomear?: (nome: string) => void;
+  porReciente: boolean;
+  onOrdenar: () => void;
+}) {
+  const [editando, setEditando] = useState(false);
+  const largo = useRef<{ t: ReturnType<typeof setTimeout> | null; x: number; y: number; disparo: boolean }>({
+    t: null,
+    x: 0,
+    y: 0,
+    disparo: false,
+  });
+  const soltar = () => {
+    if (largo.current.t) clearTimeout(largo.current.t);
+    largo.current.t = null;
+  };
+
+  if (editando && onRenomear) {
+    return (
+      <NomeDaEtapaNoQuadro
+        key={nome}
+        nome={nome}
+        onConfirmar={onRenomear}
+        autoFocus
+        onTerminar={() => setEditando(false)}
+      />
+    );
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        title={porReciente ? "Ordenado por lo más reciente · toca para el orden normal" : "Toca para ordenar por lo más reciente"}
+        className="flex min-w-0 flex-1 items-center gap-1.5 truncate rounded-sm px-1 py-0.5 text-left text-sm font-semibold text-text select-none hover:bg-surface"
+        onPointerDown={(e) => {
+          if (!onRenomear || e.button !== 0) return;
+          largo.current.x = e.clientX;
+          largo.current.y = e.clientY;
+          largo.current.disparo = false;
+          soltar();
+          largo.current.t = setTimeout(() => {
+            largo.current.t = null;
+            largo.current.disparo = true;
+            try {
+              navigator.vibrate?.(20);
+            } catch {
+              /* sin vibración */
+            }
+            setEditando(true);
+          }, 500);
+        }}
+        onPointerMove={(e) => {
+          if (largo.current.t && Math.hypot(e.clientX - largo.current.x, e.clientY - largo.current.y) > 10) soltar();
+        }}
+        onPointerUp={soltar}
+        onPointerCancel={soltar}
+        onContextMenu={(e) => {
+          if (onRenomear) e.preventDefault();
+        }}
+        onClick={() => {
+          if (largo.current.disparo) {
+            largo.current.disparo = false;
+            return;
+          }
+          onOrdenar();
+        }}
+      >
+        <span className="truncate">{nome}</span>
+        {porReciente && (
+          <span className="shrink-0 rounded-full bg-accent/15 px-1.5 py-px text-[10px] font-semibold text-text-muted">
+            ↓ recientes
+          </span>
+        )}
+      </button>
+      {onRenomear && (
+        <button
+          type="button"
+          aria-label={`Editar el nombre «${nome}»`}
+          title="Editar nombre"
+          onClick={() => setEditando(true)}
+          className="grid h-6 w-6 shrink-0 place-items-center rounded-sm text-text-muted opacity-60 hover:bg-surface hover:opacity-100"
+        >
+          <PencilSimple size={13} weight="regular" aria-hidden />
+        </button>
+      )}
+    </>
+  );
+}
+
+function NomeDaEtapaNoQuadro({
+  nome,
+  onConfirmar,
+  autoFocus = false,
+  onTerminar,
+}: {
+  nome: string;
+  onConfirmar: (nome: string) => void;
+  autoFocus?: boolean;
+  onTerminar?: () => void;
+}) {
+  const t = useT();
+  const [rascunho, setRascunho] = useState(nome);
+  // O Escape desfoca, e o desfoque chama `confirmar` na MESMA tecla: o
+  // `rascunho` que ele lê ainda é o texto digitado, e sem esta marca o Escape
+  // salvava o que devia desfazer (medido em renomear-etapa-no-quadro.test.tsx).
+  const cancelado = useRef(false);
+
+  function confirmar() {
+    const limpo = rascunho.trim();
+    if (cancelado.current || !limpo || limpo === nome) {
+      cancelado.current = false;
+      setRascunho(nome);
+      onTerminar?.();
+      return;
+    }
+    onConfirmar(limpo);
+    onTerminar?.();
+  }
+
+  return (
+    <input
+      value={rascunho}
+      maxLength={80}
+      autoFocus={autoFocus}
+      onFocus={autoFocus ? (e) => e.currentTarget.select() : undefined}
+      aria-label={`${t("Nome da etapa")} «${nome}»`}
+      data-testid="nome-etapa-quadro"
+      onChange={(e) => setRascunho(e.target.value)}
+      onBlur={confirmar}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.currentTarget.blur();
+        if (e.key === "Escape") {
+          cancelado.current = true;
+          e.currentTarget.blur();
+        }
+      }}
+      className="min-w-0 flex-1 truncate rounded-sm bg-transparent px-1 py-0.5 text-sm font-semibold text-text outline-hidden hover:bg-surface focus:bg-surface"
+    />
+  );
+}

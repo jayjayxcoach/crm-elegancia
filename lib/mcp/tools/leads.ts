@@ -1,0 +1,1003 @@
+/**
+ * MCP tools sobre /api/v1/leads (Spec 11 §3.1, §3.2).
+ *
+ *  Read:
+ *   - crm_list_leads
+ *   - crm_get_lead
+ *  Write:
+ *   - crm_create_lead
+ *   - crm_update_lead
+ *   - crm_move_lead_stage  (sem mirror REST direto; reusa moveLeadHandler)
+ *
+ * Write tools exigem role>=manager + scope mcp:write (gate no server core).
+ */
+import { z } from "zod";
+
+import {
+  listLeadsHandler,
+  countLeadsHandler,
+  getLeadHandler,
+  createLeadHandler,
+  updateLeadHandler,
+  moveLeadHandler,
+  retomarLeadHandler,
+} from "@/app/api/v1/leads/_handler";
+import { emitLeadActivity } from "@/lib/leads/activity-emitter";
+import {
+  CHAVE_DA_REFERENCIA,
+  descricaoComReferencia,
+  ehReferenciaExterna,
+} from "@/lib/leads/referencia-externa";
+import { createLeadSchema, updateLeadSchema } from "@/lib/schemas/leads";
+import { completarDestinoDoNegocio } from "@/lib/external-db/receitas/destino-pela-referencia";
+import { conferirCamposPersonalizados } from "../conferencia-de-campos";
+import { proporCamposDoNegocio } from "@/lib/leads/proposta-de-campos-por-documento";
+import {
+  TETO_DE_BYTES_DO_ANEXO,
+  TETO_DE_CARACTERES_DO_ANEXO,
+  lerAnexoDoNegocio,
+  listarAnexosDoNegocio,
+  type RecusaDeAnexo,
+} from "@/lib/leads/anexos-do-negocio";
+import { audit } from "@/lib/audit";
+import { nomesDosAtendentesCom } from "@/lib/users/nome-do-atendente";
+import type { McpContext, McpToolDefinition } from "../types";
+import { ApiError } from "@/lib/api/types";
+import { filtrarCamposLegiveisPelaIa } from "@/lib/leads/campos-do-funil";
+import { settingsDoFunil } from "@/lib/leads/campos-exigidos";
+
+/**
+ * A recusa ÚNICA das leituras de negócio durante um turno: negócio de outro
+ * cliente, inexistente, de outra organização ou sem contato ligado recebem
+ * este MESMO objeto — um uuid não vira oráculo de existência.
+ */
+const NEGOCIO_FORA_DA_CONVERSA = {
+  permitido: false,
+  motivo: "fora_da_conversa",
+  mensagem:
+    "esta conversa é com outra pessoa — um negócio que não é deste cliente não é seu para ver; " +
+    "siga a conversa com quem está falando.",
+} as const;
+
+/**
+ * A recusa de pessoal na ficha de negócio (spec 21, etapa 12).
+ *
+ * `getLeadHandler` responde 404 tanto para "não existe" quanto para "é de
+ * pessoal" (igual à conversa). Só no 404 esta leitura diagnóstica distingue —
+ * e o motivo honesto passa na frente do genérico de fora-da-conversa.
+ */
+const NEGOCIO_CONTATO_PESSOAL = {
+  permitido: false,
+  motivo: "contato_pessoal",
+  mensagem:
+    "este negócio é de um contato marcado como pessoal — fora da operação: não leia " +
+    "nem escreva aqui; siga a conversa com quem está falando.",
+} as const;
+
+export async function recusaSeLeadDePessoal(
+  ctx: McpContext,
+  leadId: string,
+): Promise<typeof NEGOCIO_CONTATO_PESSOAL | null> {
+  const { data: lead } = await ctx.supabase
+    .from("crm_leads")
+    .select("contact_id")
+    .eq("organization_id", ctx.organizationId)
+    .eq("id", leadId)
+    .maybeSingle();
+  const contactId = (lead as { contact_id?: string | null } | null)?.contact_id;
+  if (!contactId) return null;
+  const { data: contato } = await ctx.supabase
+    .from("contacts")
+    .select("is_personal")
+    .eq("organization_id", ctx.organizationId)
+    .eq("id", contactId)
+    .maybeSingle();
+  return (contato as { is_personal?: boolean } | null)?.is_personal === true
+    ? NEGOCIO_CONTATO_PESSOAL
+    : null;
+}
+
+/**
+ * A unidade de `value_cents` DITA AO MODELO. O negócio guarda o valor × 100 em
+ * QUALQUER moeda — inclusive guarani, que não tem centavo (ver
+ * `formatValorDoNegocio` em `lib/money.ts`) —, e o catálogo não: `preco_cents`
+ * vem em unidades da moeda. Sem esta linha a conversão dependia só do prompt de
+ * cada organização, e um prompt que esquecesse gravava o pedido cem vezes menor.
+ */
+const VALOR_DO_NEGOCIO =
+  "valor do negócio × 100, em QUALQUER moeda (também guarani): R$ 249,90 → 24990; ₲125.000 → 12500000. " +
+  "O preço do catálogo (preco_cents) NÃO segue esta régua em moeda sem centavos: multiplique por 100.";
+
+/**
+ * A MENSALIDADE, e por que ela NÃO é o `value_cents` (fatia 1 da #3602).
+ *
+ * Num negócio de setup + mensalidade o `value_cents` guarda SÓ o setup. Somar a
+ * mensalidade nele (ou mandá-la no lugar dele) é o erro que a issue descreve: o
+ * card passa a mostrar um número que ninguém sabe separar, e o painel não
+ * consegue dizer quanto entra todo mês. A régua de centavos é a mesma do valor
+ * único — é dinheiro de negócio, ×100 em qualquer moeda.
+ */
+const VALOR_RECORRENTE =
+  "mensalidade × 100, separada do valor único (setup NUNCA entra aqui): R$ 500/mês → 50000.";
+
+/** Os três campos que o agente pode escrever — e que a leitura devolve. */
+const RECORRENCIA = {
+  recurring_value_cents: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe(VALOR_RECORRENTE),
+  recurring_period: z
+    .literal("monthly")
+    .optional()
+    .describe("Periodicidade da recorrência: hoje só 'monthly'. Omitida com mensalidade presente, nasce mensal."),
+  recurring_months: z
+    .number()
+    .int()
+    .min(1)
+    .max(600)
+    .optional()
+    .describe("Duração do contrato em meses. Omitida = sem prazo (não é 12)."),
+};
+
+/**
+ * Enriquece rows de lead com os campos de governança aditivos (G6-03):
+ * `owner_user_name` (só o nome — LGPD) e `stage` ({ id, name }, o label legível
+ * que o get_lead_context compõe). owner_user_id, stage_id, status e tags[] já
+ * vêm na row (`select *`); nada existente muda. Dedupe de owners e stages —
+ * sem N+1 numa listagem.
+ */
+async function enrichLeads(
+  ctx: McpContext,
+  leads: Array<Record<string, unknown>>,
+): Promise<Array<Record<string, unknown>>> {
+  if (leads.length === 0) return leads;
+
+  const names = await nomesDosAtendentesCom(
+    ctx.supabase,
+    ctx.organizationId,
+    leads.map((l) => l.owner_user_id as string | null),
+  );
+
+  const stageIds = [
+    ...new Set(leads.map((l) => l.stage_id).filter((id): id is string => Boolean(id))),
+  ];
+  const stageById = new Map<string, { id: string; name: string }>();
+  if (stageIds.length > 0) {
+    const { data } = await ctx.supabase
+      .from("crm_stages")
+      .select("id, name")
+      .eq("organization_id", ctx.organizationId)
+      .in("id", stageIds);
+    for (const s of (data ?? []) as Array<{ id: string; name: string }>) {
+      stageById.set(s.id, { id: s.id, name: s.name });
+    }
+  }
+
+  return leads.map((l) => ({
+    ...l,
+    owner_user_name: l.owner_user_id
+      ? (names.get(l.owner_user_id as string) ?? null)
+      : null,
+    stage: l.stage_id ? (stageById.get(l.stage_id as string) ?? null) : null,
+  }));
+}
+
+/**
+ * O recorte do turno (#4669): DENTRO de um turno de agente o `custom_fields`
+ * de TODA resposta de negócio é o que o modelo lê — leitura e escrita, porque
+ * `crm_update_lead` e as irmãs devolvem a linha inteira (`select *`) e o modelo
+ * a lê do mesmo jeito. Só saem as chaves que o dono do funil marcou "A IA pode
+ * ler". Sem turno (token de pessoa) a ficha volta inteira: quem lê é uma
+ * pessoa, com a permissão dela. Um `settings` por funil distinto, sem N+1.
+ */
+async function recortarParaOTurno(
+  ctx: McpContext,
+  leads: Array<Record<string, unknown>>,
+): Promise<Array<Record<string, unknown>>> {
+  if (!ctx.contatoDoTurno || leads.length === 0) return leads;
+  const funis = [...new Set(leads.map((l) => l.pipeline_id as string | null | undefined))];
+  const settingsPorFunil = new Map(
+    await Promise.all(
+      funis.map(async (id) => [id, await settingsDoFunil(ctx.supabase, id, ctx.organizationId)] as const),
+    ),
+  );
+  return leads.map((l) =>
+    "custom_fields" in l
+      ? {
+          ...l,
+          custom_fields: filtrarCamposLegiveisPelaIa(
+            settingsPorFunil.get(l.pipeline_id as string | null | undefined) as
+              | Record<string, unknown>
+              | null,
+            l.custom_fields,
+          ),
+        }
+      : l,
+  );
+}
+
+/** O mesmo recorte para a resposta de UM negócio. */
+async function recortarUmParaOTurno(
+  ctx: McpContext,
+  lead: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const [recortado] = await recortarParaOTurno(ctx, [lead]);
+  return recortado ?? lead;
+}
+
+// ---------------------------------------------------------------------------
+// list
+// ---------------------------------------------------------------------------
+
+const listInputShape = {
+  pipeline_id: z.string().uuid().optional(),
+  stage_id: z.string().uuid().optional(),
+  status: z.enum(["open", "won", "lost"]).optional(),
+  owner_user_id: z.string().uuid().optional(),
+  /** `lost_reason` exato do negócio perdido (issue #1537). */
+  lost_reason: z.string().min(1).max(500).optional(),
+  /**
+   * Categoria do motivo de perda (issue #1537) — resolve pela mesma régua do
+   * relatório "Perdas" (`motivosDaCategoria`). Recomendado junto com
+   * `pipeline_id`: sem escopo de funil a lista é a união dos funis da org.
+   */
+  lost_reason_category: z.string().min(1).max(40).optional(),
+  limit: z.number().int().min(1).max(100).default(20),
+  cursor: z.string().optional(),
+};
+
+export const crmListLeads: McpToolDefinition<typeof listInputShape> = {
+  name: "crm_list_leads",
+  description:
+    "Lista leads do CRM filtrando por pipeline, stage, status e owner. Cursor base64 para paginação. " +
+    "Governança por lead: owner_user_id + owner_user_name (só o nome do dono, sem email/telefone), stage ({ id, name } legível além do stage_id) e tags[]." +
+    " Em conversa de atendimento, lista apenas os negócios do contato desta conversa.",
+  inputSchema: listInputShape,
+  category: "read",
+  requiresRole: "agent",
+  requiresScope: "mcp:read",
+  handler: async (input, ctx) => {
+    const result = await listLeadsHandler(
+      ctx.supabase,
+      {
+        organization_id: ctx.organizationId,
+        actor: ctx.actor,
+        requestId: ctx.requestId,
+      },
+      {
+        pipeline_id: input.pipeline_id,
+        stage_id: input.stage_id,
+        status: input.status,
+        owner_user_id: input.owner_user_id,
+        lost_reason: input.lost_reason,
+        lost_reason_category: input.lost_reason_category,
+        // Escopo do turno NA CONSULTA, antes do limite: filtrar a página depois
+        // esconderia negócios do próprio cliente que caíssem fora dela.
+        contact_id: ctx.contatoDoTurno,
+        limit: input.limit,
+        cursor: input.cursor,
+      },
+    );
+    return {
+      leads: await enrichLeads(ctx, await recortarParaOTurno(ctx, result.leads)),
+      cursor: result.cursor,
+      has_more: result.has_more,
+    };
+  },
+};
+
+// ---------------------------------------------------------------------------
+// count
+// ---------------------------------------------------------------------------
+const countInputShape = {
+  pipeline_id: z.string().uuid().optional(),
+  stage_id: z.string().uuid().optional(),
+  status: z.enum(["open", "won", "lost"]).optional(),
+};
+
+export const crmCountLeads: McpToolDefinition<typeof countInputShape> = {
+  name: "crm_count_leads",
+  description:
+    "Conta leads por pipeline, stage e status e devolve só números (total e, sem filtro de status, o total por status), nunca nomes nem ids. " +
+    "Para 'quantos leads?', use esta em vez de paginar crm_list_leads. Em atendimento, conta só os negócios do contato da conversa.",
+  inputSchema: countInputShape,
+  category: "read",
+  requiresRole: "agent",
+  requiresScope: "mcp:read",
+  handler: async (input, ctx) => {
+    return countLeadsHandler(
+      ctx.supabase,
+      {
+        organization_id: ctx.organizationId,
+        actor: ctx.actor,
+        requestId: ctx.requestId,
+      },
+      {
+        pipeline_id: input.pipeline_id,
+        stage_id: input.stage_id,
+        status: input.status,
+        // Mesmo escopo do turno da listagem, no WHERE.
+        contact_id: ctx.contatoDoTurno,
+      },
+    );
+  },
+};
+
+// ---------------------------------------------------------------------------
+// get
+// ---------------------------------------------------------------------------
+
+const getInputShape = {
+  lead_id: z.string().uuid(),
+};
+
+export const crmGetLead: McpToolDefinition<typeof getInputShape> = {
+  name: "crm_get_lead",
+  description:
+    "Retorna um lead pelo UUID. Inclui pipeline_id, stage_id, status, owner. " +
+    "Governança: owner_user_id + owner_user_name (só o nome, sem email/telefone), stage ({ id, name } legível) e tags[]." +
+    " Em conversa de atendimento, só abre negócio do contato desta conversa.",
+  inputSchema: getInputShape,
+  category: "read",
+  requiresRole: "agent",
+  requiresScope: "mcp:read",
+  handler: async (input, ctx) => {
+    const doTurno = ctx.contatoDoTurno;
+    let lead: Record<string, unknown> | null = null;
+    try {
+      lead = await getLeadHandler(
+        ctx.supabase,
+        {
+          organization_id: ctx.organizationId,
+          actor: ctx.actor,
+          requestId: ctx.requestId,
+        },
+        input.lead_id,
+      );
+    } catch (e: unknown) {
+      // Com turno, o `404` vira a MESMA recusa do negócio de outro cliente.
+      if (!(e instanceof ApiError) || e.status !== 404) throw e;
+      // ...exceto quando o negócio EXISTE e é de pessoal: motivo honesto nos
+      // dois ingressos. Diagnóstico só neste 404 — fora dele, nada muda.
+      const recusa = await recusaSeLeadDePessoal(ctx, input.lead_id);
+      if (recusa) return recusa;
+      if (!doTurno) throw e;
+      lead = null;
+    }
+    if (doTurno && (!lead || lead.contact_id !== doTurno)) return NEGOCIO_FORA_DA_CONVERSA;
+    if (!lead) throw new Error("not_found");
+    if ((lead as { organization_id?: string }).organization_id !== ctx.organizationId) {
+      // Defesa em profundidade — service-role bypassa RLS.
+      throw new Error("not_found");
+    }
+    const [enriched] = await enrichLeads(ctx, await recortarParaOTurno(ctx, [lead]));
+    return { lead: enriched };
+  },
+};
+
+// ---------------------------------------------------------------------------
+// create
+// ---------------------------------------------------------------------------
+
+const createInputShape = {
+  // Opcionais SÓ por causa da `referencia_externa`: com a referência de um item cuja
+  // receita tem funil de destino, o sistema completa os dois (R5c). Sem ela, a
+  // ausência é recusada com a mensagem de ensino (`completarDestinoDoNegocio`).
+  pipeline_id: z
+    .string()
+    .uuid()
+    .optional()
+    .describe("Omita, com stage_id, ao passar referencia_externa."),
+  stage_id: z
+    .string()
+    .uuid()
+    .optional()
+    .describe("Omita, com pipeline_id, ao passar referencia_externa."),
+  title: z.string().min(2).max(200),
+  description: z.string().max(2000).optional(),
+  contact_id: z.string().uuid().optional(),
+  value_cents: z.number().int().nonnegative().optional().describe(VALOR_DO_NEGOCIO),
+  ...RECORRENCIA,
+  currency: z.string().length(3).optional(),
+  owner_user_id: z.string().uuid().optional(),
+  /** 0070: o agente pode nascer dono do negócio que ele mesmo abriu. */
+  owner_agent_id: z.string().uuid().optional(),
+  expected_close_date: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .optional(),
+  tags: z.array(z.string()).optional(),
+  source: z.string().optional(),
+  /**
+   * O item do banco externo que o cliente escolheu (Spec 25, R5a): `<receita>:<id>`,
+   * montado do resultado de `crm_consultar_receita`. Fica no negócio para o humano
+   * continuar de onde o robô parou, e o mesmo cliente repetindo o interesse no
+   * mesmo item NÃO abre outro negócio.
+   */
+  referencia_externa: z
+    .string()
+    // `refine`, não `.regex()`: o padrão iria no esquema de todo passo de todo turno,
+    // em toda instalação, e este campo só serve a quem usa o banco externo.
+    .refine(ehReferenciaExterna, "use o formato <receita>:<id>")
+    .optional()
+    .describe("O item que o cliente escolheu num resultado de receita: <receita>:<id>, com o id da linha. Nunca invente."),
+  /**
+   * Os campos que o DONO declarou em `pipeline.settings.fields` (#2297).
+   *
+   * Sem esta chave a ferramenta não tem como criar um negócio numa etapa
+   * exigente nem quando o agente JÁ SABE o valor: `z.object` descarta a chave
+   * que não declarou, o valor morria antes do `createLeadHandler` — quem
+   * pergunta a régua —, e a recusa (422 `required_fields_missing`) acontecia
+   * sem que houvesse como evitá-la. Mesmo desenho do `crm_update_lead`, que já
+   * declarava a chave; o schema de criação do REST continua sem ela porque lá
+   * ela é gerida pelo servidor (o valor entra por fora do `parse`, no handler).
+   */
+  custom_fields: z.record(z.string(), z.unknown()).optional(),
+};
+
+export const crmCreateLead: McpToolDefinition<typeof createInputShape> = {
+  name: "crm_create_lead",
+  description:
+    "Cria um lead no pipeline informado. Use após qualificar um contato. Position é gerenciado pelo servidor.",
+  inputSchema: createInputShape,
+  category: "write",
+  requiresRole: "agent",
+  requiresScope: "mcp:write",
+  handler: async (input, ctx) => {
+    // Spec 25 (R5c) — funil e etapa podem faltar quando o agente passa só a
+    // referência de um item: o sistema os acha na receita. No turno do agente o
+    // wrapper (`lib/ai/runtime/tools.ts`) já completou ANTES do escopo de funil;
+    // aqui vale para quem chega por outra porta (MCP externo, rota). Sem nada
+    // disso, a ausência é recusada com a mensagem de ensino.
+    //
+    // #4763, item 2: com funil à mão e sem referência, a guarda também consulta
+    // o destino das receitas ativas — o funil que é destino de item, num turno
+    // de conversa, recusa a criação sem a referência. `ctx.contatoDoTurno` é o
+    // contexto de confiança do turno (nunca vem dos argumentos da tool), e a
+    // ausência dele mantém rota e integração exatamente como estavam.
+    const destinoArgs: Record<string, unknown> = {
+      pipeline_id: input.pipeline_id,
+      stage_id: input.stage_id,
+      referencia_externa: input.referencia_externa,
+    };
+    const completo = await completarDestinoDoNegocio(ctx.supabase, ctx.organizationId, destinoArgs, {
+      turnoComContato: !!ctx.contatoDoTurno,
+    });
+    if (!completo.ok) return completo.resposta;
+    const pipelineId = destinoArgs.pipeline_id as string;
+    const stageId = destinoArgs.stage_id as string;
+
+    // Spec 25 (R5a) — o MESMO cliente repetindo o interesse no MESMO item não abre
+    // outro negócio: acha o que já está aberto no funil e deixa uma nota na
+    // timeline. Só com contato (sem ele não há "mesmo cliente") e só entre os
+    // ABERTOS — um negócio perdido ou ganho não impede o interesse novo. Filtra a
+    // organização à mão: o cliente de serviço ignora a RLS.
+    // No turno do agente o contato TEM de ser o da conversa (a conferência de escopo
+    // já o exige antes de chegar aqui; repetida como nas ferramentas irmãs), e o
+    // negócio de contato pessoal está fora da operação.
+    const doTurno = ctx.contatoDoTurno;
+    const contatoDeOutraConversa =
+      !!doTurno && !!input.contact_id && input.contact_id.toLowerCase() !== doTurno.toLowerCase();
+    if (input.referencia_externa && input.contact_id && !contatoDeOutraConversa) {
+      const { data: existente } = await ctx.supabase
+        .from("crm_leads")
+        .select("id, title, pipeline_id, stage_id, status")
+        .eq("organization_id", ctx.organizationId)
+        .eq("contact_id", input.contact_id)
+        .eq("pipeline_id", pipelineId)
+        .eq("status", "open")
+        .eq(`source_metadata->>${CHAVE_DA_REFERENCIA}`, input.referencia_externa)
+        .limit(1)
+        .maybeSingle();
+      if (existente) {
+        const recusaPessoal = await recusaSeLeadDePessoal(ctx, (existente as { id: string }).id);
+        if (recusaPessoal) return recusaPessoal;
+        await emitLeadActivity(ctx.supabase, {
+          organizationId: ctx.organizationId,
+          leadId: (existente as { id: string }).id,
+          contactId: input.contact_id,
+          type: "note",
+          sourceModule: "referencia-externa",
+          actor: ctx.actor,
+          reason: `O cliente voltou a demonstrar interesse em ${input.referencia_externa}`,
+          payload: { [CHAVE_DA_REFERENCIA]: input.referencia_externa },
+        });
+        return { lead: existente, ja_existia: true };
+      }
+    }
+    const parsed = createLeadSchema.parse({
+      pipeline_id: pipelineId,
+      stage_id: stageId,
+      title: input.title,
+      description: input.referencia_externa
+        ? descricaoComReferencia(input.description, input.referencia_externa)
+        : (input.description ?? null),
+      contact_id: input.contact_id ?? null,
+      value_cents: input.value_cents ?? null,
+      // A mensalidade viaja SEPARADA do valor único (fatia 1 da #3602). Sem
+      // estas três linhas o `createLeadSchema.parse` abaixo descartaria as
+      // chaves em silêncio — o agente criaria o negócio de setup + mensalidade
+      // com metade do contrato, e nada falharia.
+      recurring_value_cents: input.recurring_value_cents ?? null,
+      recurring_period: input.recurring_period,
+      recurring_months: input.recurring_months ?? null,
+      // Ausente, a moeda é a da organização (`createLeadHandler` a lê): um
+      // literal "BRL" aqui fazia o agente criar em real numa empresa em euro.
+      currency: input.currency,
+      owner_user_id: input.owner_user_id ?? null,
+      owner_agent_id: input.owner_agent_id ?? null,
+      expected_close_date: input.expected_close_date ?? null,
+      tags: input.tags ?? [],
+      source: input.source ?? "ai_agent",
+    });
+    // #2234 na CRIAÇÃO (#2302): a mesma conferência do `crm_update_lead`. Sem
+    // ela, a chave nova deixava a IA cumprir a régua da etapa com um valor que
+    // o cliente não disse. O campo recusado sai do insert; se a etapa o exige,
+    // a régua devolve o 422 — coerente: o cliente não disse.
+    const conferencia = await conferirCamposPersonalizados(
+      ctx,
+      { pipelineId },
+      input.custom_fields,
+    );
+    const custom_fields = conferencia.custom_fields ?? input.custom_fields;
+    const lead = await createLeadHandler(
+      ctx.supabase,
+      {
+        organization_id: ctx.organizationId,
+        actor: ctx.actor,
+        requestId: ctx.requestId,
+      },
+      // `custom_fields` entra POR FORA do `createLeadSchema.parse`, de
+      // propósito: o schema de criação aceita a chave desde #3038, mas o parse
+      // acima não a repassa, porque o valor que vale é o que sai de
+      // `conferirCamposPersonalizados` (sem os campos recusados). É a interseção
+      // que o webhook de captação também monta. Sem isto o argumento do agente
+      // morria aqui dentro, antes da régua que ele precisa satisfazer (#2297,
+      // caminho 2).
+      {
+        ...parsed,
+        ...(custom_fields === undefined ? {} : { custom_fields }),
+        ...(input.referencia_externa
+          ? { source_metadata: { [CHAVE_DA_REFERENCIA]: input.referencia_externa } }
+          : {}),
+      },
+    );
+    return {
+      lead: await recortarUmParaOTurno(ctx, lead),
+      ...(conferencia.recusados.length > 0
+        ? {
+            campos_nao_gravados: conferencia.recusados,
+            erro_de_ensino: conferencia.recusados.map((r) => r.mensagem).join(" "),
+          }
+        : {}),
+    };
+  },
+};
+
+// ---------------------------------------------------------------------------
+// update
+// ---------------------------------------------------------------------------
+
+const updateInputShape = {
+  lead_id: z.string().uuid(),
+  title: z.string().min(2).max(200).optional(),
+  description: z.string().max(2000).optional(),
+  contact_id: z.string().uuid().optional(),
+  value_cents: z.number().int().nonnegative().optional().describe(VALOR_DO_NEGOCIO),
+  ...RECORRENCIA,
+  currency: z.string().length(3).optional(),
+  owner_user_id: z.string().uuid().optional(),
+  /** 0070: transferir o negócio para (ou de) um agente — passa pelo mesmo helper. */
+  owner_agent_id: z.string().uuid().optional(),
+  expected_close_date: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .optional(),
+  /**
+   * AS ETIQUETAS DO NEGÓCIO (#4666) — e a descrição de `tags` diz a verdade.
+   *
+   * `tags` SUBSTITUI a lista inteira, e é o contrato antigo: renomear ou
+   * reinterpretar o campo quebraria quem já o manda. O que faltava era
+   * `tags_adicionar`/`tags_remover` — o que o agente quase sempre quer — e a
+   * frase que avisa que a lista é substituída, porque sem ela o modelo apagava
+   * etiqueta acreditando acrescentar.
+   *
+   * A normalização NÃO mora no shape: `z.toJSONSchema` recusa `transform`
+   * ("Transforms cannot be represented in JSON Schema", medido no zod 4.6), e o
+   * shape bruto é justamente o que vira o esquema que o modelo lê. Ela mora em
+   * `updateLeadSchema` (`lib/schemas/leads.ts`), que é o schema que este handler
+   * parseia com `updateLeadSchema.parse(rest)` — a mesma régua para o MCP e para
+   * o PATCH REST, sem uma segunda regra.
+   */
+  tags: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Substitui a lista INTEIRA de etiquetas do negócio: o que não vier aqui é APAGADO. " +
+        "Para acrescentar use tags_adicionar; para tirar só algumas, tags_remover.",
+    ),
+  tags_adicionar: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Etiquetas a ACRESCENTAR à lista atual (união): as que já estão ficam. É o que usar " +
+        'para "marcar o negócio com X".',
+    ),
+  tags_remover: z
+    .array(z.string())
+    .optional()
+    .describe("Etiquetas a REMOVER da lista atual (diferença): as demais ficam."),
+  /**
+   * Os campos que o DONO declarou em `pipeline.settings.fields`.
+   *
+   * Faltava aqui, e só aqui: `updateLeadSchema` já aceita a chave, o
+   * `updateLeadHandler` já faz o merge com o que existe, e a mudança já vira
+   * atividade na linha do tempo ("os campos personalizados"). Como o handler
+   * monta `{...rest}` a partir DESTE shape, e `z.object` descarta chave que não
+   * declarou, o valor morria antes de chegar ao schema que o aceitaria.
+   *
+   * Efeito da ausência: o produto deixa criar até 50 campos por funil, desenha
+   * todos na ficha do lead — e nenhum agente conseguia preencher um. Quem
+   * modelou o funil no vocabulário do próprio nicho recebia a IA como leitora,
+   * nunca como escrivã.
+   */
+  custom_fields: z.record(z.string(), z.unknown()).optional(),
+};
+
+export const crmUpdateLead: McpToolDefinition<typeof updateInputShape> = {
+  name: "crm_update_lead",
+  description:
+    "Atualiza campos editáveis de um lead. Stage transitions são via crm_move_lead_stage; status é gerenciado por triggers. " +
+    "`tags` SUBSTITUI a lista inteira de etiquetas; para acrescentar use `tags_adicionar`.",
+  inputSchema: updateInputShape,
+  category: "write",
+  requiresRole: "agent",
+  requiresScope: "mcp:write",
+  handler: async (input, ctx) => {
+    const { lead_id, ...rest } = input;
+    const parsed = updateLeadSchema.parse(rest);
+    // #2234 — a IA só grava o que o CLIENTE disse. A conferência vale só para a
+    // origem do agente de IA (tela, API de terceiros e automação passam por
+    // aqui sem nenhuma leitura): o degrau 1 confere número, data, e-mail e
+    // dinheiro em código, o degrau 2 pergunta ao Jev o que sobrou, e o que o
+    // cliente não disse volta como ERRO DE ENSINO para o modelo, com os outros
+    // campos da mesma chamada seguindo gravando (`lib/mcp/conferencia-de-campos`).
+    const conferencia = await conferirCamposPersonalizados(ctx, { leadId: lead_id }, parsed.custom_fields);
+    const lead = await updateLeadHandler(
+      ctx.supabase,
+      {
+        organization_id: ctx.organizationId,
+        actor: ctx.actor,
+        requestId: ctx.requestId,
+      },
+      lead_id,
+      conferencia.custom_fields === undefined
+        ? parsed
+        : { ...parsed, custom_fields: conferencia.custom_fields },
+    );
+    return {
+      lead: await recortarUmParaOTurno(ctx, lead),
+      ...(conferencia.recusados.length > 0
+        ? {
+            campos_nao_gravados: conferencia.recusados,
+            erro_de_ensino: conferencia.recusados.map((r) => r.mensagem).join(" "),
+          }
+        : {}),
+    };
+  },
+};
+
+// ---------------------------------------------------------------------------
+// move stage
+// ---------------------------------------------------------------------------
+
+const moveInputShape = {
+  lead_id: z.string().uuid(),
+  to_stage_id: z.string().uuid(),
+  position_in_stage: z.number().finite().optional(),
+  reason: z.string().max(500).optional(),
+  /**
+   * O motivo do ganho, quando o destino fecha o negócio como ganho (issue #1536).
+   * Obrigatório só se o funil ligar `won_reason_required`; sem lista cadastrada
+   * o texto é livre. A recusa (`required_fields_missing` /
+   * `won_reason_invalid`) volta como erro da tool, e o modelo pergunta ao
+   * cliente ou passa para o humano — nunca move calado.
+   */
+  won_reason: z.string().max(500).optional(),
+  /**
+   * O motivo da perda, quando o destino é etapa de perda (issue #917). O banco
+   * confere contra o vocabulário do funil (canônico + `settings.lost_reasons`) e
+   * recusa a perda sem ele. O `moveLeadHandler` já aceitava; a tool descartava.
+   * Sem `.min(1)`: motivo em branco é tratado em lib/leads/motivo-da-perda.ts como
+   * ausente — a mesma régua do moveLeadSchema e do won_reason; string vazia
+   * morrendo no zod daria uma mensagem diferente da recusa de negócio.
+   */
+  lost_reason: z.string().max(500).optional(),
+};
+
+export const crmMoveLeadStage: McpToolDefinition<typeof moveInputShape> = {
+  name: "crm_move_lead_stage",
+  description:
+    "Move um lead para outro stage dentro do MESMO pipeline. Audit registra from/to stage e reason. " +
+    "Mover para uma etapa de perda exige lost_reason, com um motivo do vocabulário do funil. " +
+    // "use clone" apontava para uma porta que o agente NÃO tem: não existe tool
+    // de clone em lib/mcp/tools/, e ele não faz HTTP autenticado por cookie de
+    // sessão. Instrução que não pode ser cumprida faz o modelo prometer ao
+    // cliente uma ação que nunca acontece — o mesmo defeito da #922, do outro
+    // lado. A tool de clone é fatia própria; até lá, a saída honesta é o humano.
+    "Levar o negócio para OUTRO funil é proibido aqui e ainda não é uma ferramenta sua: " +
+    "não prometa ao cliente que você vai mudar o funil — diga que vai passar para a equipe.",
+  inputSchema: moveInputShape,
+  category: "write",
+  requiresRole: "agent",
+  requiresScope: "mcp:write",
+  handler: async (input, ctx) => {
+    const lead = await moveLeadHandler(
+      ctx.supabase,
+      {
+        organization_id: ctx.organizationId,
+        actor: ctx.actor,
+        requestId: ctx.requestId,
+      },
+      input.lead_id,
+      {
+        to_stage_id: input.to_stage_id,
+        position_in_stage: input.position_in_stage,
+        reason: input.reason,
+        won_reason: input.won_reason,
+        lost_reason: input.lost_reason,
+      },
+    );
+    return { lead: await recortarUmParaOTurno(ctx, lead) };
+  },
+};
+
+
+// ---------------------------------------------------------------------------
+// retomar como novo negócio (issue #1538)
+// ---------------------------------------------------------------------------
+
+const retomarInputShape = {
+  lead_id: z.string().uuid(),
+  /**
+   * A etapa da NOVA tentativa, no MESMO funil do negócio original. Sem ela o
+   * handler escolhe a primeira etapa aberta do funil.
+   */
+  stage_id: z.string().uuid().optional(),
+};
+
+export const crmRetomarLead: McpToolDefinition<typeof retomarInputShape> = {
+  name: "crm_retomar_lead",
+  description:
+    "Retoma um negócio ENCERRADO (perdido ou ganho) como um negócio NOVO no mesmo funil, com o mesmo contato, " +
+    "source='retomada' e retomado_de_lead_id apontando para o original — que NÃO é alterado (status e motivo ficam intactos). " +
+    "É o que fazer quando o cliente volta depois de uma venda fechada e a equipe quer uma nova tentativa registrada: " +
+    "em funis com reabertura 'novo_negocio', o crm_move_lead_stage devolve 409 reabertura_cria_novo e esta é a porta que resolve. " +
+    "O negócio original precisa estar encerrado; um negócio ABERTO é recusado (reabertura_lead_aberto).",
+  inputSchema: retomarInputShape,
+  category: "write",
+  requiresRole: "agent",
+  requiresScope: "mcp:write",
+  handler: async (input, ctx) => {
+    const lead = await retomarLeadHandler(
+      ctx.supabase,
+      {
+        organization_id: ctx.organizationId,
+        actor: ctx.actor,
+        requestId: ctx.requestId,
+      },
+      input.lead_id,
+      { stage_id: input.stage_id },
+    );
+    return { lead: await recortarUmParaOTurno(ctx, lead) };
+  },
+};
+
+// ---------------------------------------------------------------------------
+// crm_propose_lead_fields_from_document — o voucher lido vira proposta (#3316)
+// ---------------------------------------------------------------------------
+
+const camposDoDocumentoShape = {
+  lead_id: z.string().uuid(),
+  /**
+   * O documento ANEXADO AO NEGÓCIO de onde vieram os valores, quando houver —
+   * `crm_lead_attachments.id` (a rota de anexos do card). Opcional porque o
+   * documento pode ainda estar só na conversa; o `attachment_id` é a ponte que
+   * a revisão usa para abrir o arquivo ao lado do trecho.
+   */
+  attachment_id: z.string().uuid().optional(),
+  campos: z
+    .array(
+      z.object({
+        campo: z
+          .string()
+          .min(1)
+          .max(40)
+          .describe("A chave do campo NO FUNIL do negócio (pipeline.settings.fields)."),
+        valor: z.string().min(1).max(2000).describe("O valor lido no documento, como texto."),
+        trecho: z
+          .string()
+          .max(500)
+          .optional()
+          .describe("O trecho do documento de onde o valor veio. SEM trecho a proposta é recusada."),
+      }),
+    )
+    .min(1)
+    .max(25),
+};
+
+/**
+ * ⚠️ Esta ferramenta NÃO grava o card — com UMA exceção: NENHUMA.
+ *
+ * Ela cria LINHAS EM `lead_field_proposals`, que uma PESSOA confirma campo a
+ * campo pela tela de revisão (`RevisaoDoDocumento`, no dossiê do negócio). O
+ * `description` diz isso EM PRIMEIRO LUGAR, de propósito: um modelo que
+ * acreditasse ter gravado responderia "pronto, já anotei o localizador no seu
+ * cadastro" ao cliente, prometendo o que não aconteceu.
+ *
+ * A leitura do documento é a que o agente JÁ faz na conversa (partes de mídia,
+ * transcrição) — nenhum cliente de mídia novo nasce aqui. O que esta tool recebe
+ * é o resultado dessa leitura, campo a campo, com o trecho de origem.
+ */
+export const crmProposeLeadFieldsFromDocument: McpToolDefinition<typeof camposDoDocumentoShape> = {
+  name: "crm_propose_lead_fields_from_document",
+  description:
+    "Registra, a partir de um DOCUMENTO que você leu (voucher, bilhete, apólice, confirmação de hotel), valores " +
+    "PROPOSTOS para os campos do card de um negócio — a proposta espera que uma PESSOA confira e confirme campo a " +
+    "campo numa tela de revisão, com o valor atual, o proposto e o trecho do documento à vista. NADA é gravado no " +
+    "card por esta chamada: nunca diga ao cliente que o cadastro foi atualizado — diga que os dados do documento " +
+    "foram separados para a equipe conferir. Passe SÓ campos que existem no funil do negócio (pipeline.settings.fields, " +
+    "os campos do CARD), cada valor COM o trecho de onde veio (sem trecho a proposta é recusada). Recusa campo fora " +
+    "do funil, campo de ficha de contato, valor igual ao que já está no card, valor fora da lista de opções ou fora do " +
+    "padrão do campo, e proposta repetida do mesmo campo enquanto outra aguarda decisão.",
+  inputSchema: camposDoDocumentoShape,
+  category: "write",
+  requiresRole: "agent",
+  requiresScope: "mcp:write",
+  handler: async (input, ctx) => {
+    // Contato pessoal está fora da operação (spec 21, decisão 3) — a MESMA
+    // recusa das leituras de negócio: nada se escreve para ele, nem proposta.
+    const pessoal = await recusaSeLeadDePessoal(ctx, input.lead_id);
+    if (pessoal) return pessoal;
+
+    const r = await proporCamposDoNegocio(ctx.supabase, {
+      organizationId: ctx.organizationId,
+      leadId: input.lead_id,
+      campos: input.campos.map((c) => ({ campo: c.campo, valor: c.valor, trecho: c.trecho ?? null })),
+      attachmentId: input.attachment_id ?? null,
+      // ⚠️ `agent_id`, NUNCA `actor.id` — a coluna tem FK para `ai_agents`, e o
+      // id do run/token quebraria o INSERT (a mesma decisão da proposta de
+      // contato em `lib/mcp/tools/contacts.ts`).
+      agentId: ctx.actor.type === "ai_agent" ? (ctx.actor.agent_id ?? null) : null,
+    });
+
+    if (r.criadas.length > 0) {
+      // SÓ METADADO, e o comentário é o contrato: ids e campos, nunca os valores
+      // lidos do documento. O valor já vive na linha da proposta, que é dado e
+      // é redigida pela cascata; o log é metadado, não conteúdo (foi copiar o
+      // valor para cá que fechou o #3415).
+      await audit({
+        action: "lead.field_proposed",
+        actorUserId: ctx.actor.type === "user" ? (ctx.actor.id as string) : null,
+        organizationId: ctx.organizationId,
+        resourceType: "crm_lead",
+        resourceId: input.lead_id,
+        requestId: ctx.requestId,
+        metadata: {
+          proposal_ids: r.criadas.map((c) => c.id),
+          campos: r.criadas.map((c) => c.campo),
+          attachment_id: input.attachment_id ?? null,
+          origem: "documento",
+        },
+      });
+    }
+
+    return {
+      propostas_criadas: r.criadas,
+      recusadas: r.recusadas,
+      mensagem:
+        "As propostas entraram na FILA de revisão do negócio; ninguém gravou o card ainda. Diga ao cliente que os " +
+        "dados do documento foram separados para a equipe conferir — não diga que o cadastro foi atualizado.",
+    };
+  },
+};
+
+// ---------------------------------------------------------------------------
+// crm_list_lead_attachments / crm_get_lead_attachment — o documento do card (#4544)
+// ---------------------------------------------------------------------------
+
+/**
+ * O documento que a pessoa anexou no card era o ÚNICO lugar do fluxo que o
+ * agente não alcançava: `crm_propose_lead_fields_from_document` já aceitava um
+ * `attachment_id`, mas descobrir esse id — e ler o PDF — exigia abrir a tela.
+ * As duas ferramentas abaixo são o par que fecha o caso real (apólice, voucher,
+ * localizador): listar para descobrir o id, ler para tirar os valores do texto.
+ *
+ * As duas DELEGAM para `lib/leads/anexos-do-negocio`, que repete o caminho da
+ * rota de mídia (negócio na organização → linha do anexo presa ao negócio →
+ * posse do caminho → extração única de `extrairTextoDoArquivo`). Nenhuma
+ * ferramenta abre leitura própria de arquivo.
+ *
+ * Contato pessoal continua fora da operação: as duas passam pelo MESMO portão
+ * das demais leituras de negócio, e o contato do turno continua mandando — o
+ * anexo não é uma porta lateral para o negócio de outro cliente.
+ */
+function recusaDeAnexoComoResultado(recusa: RecusaDeAnexo) {
+  if (recusa.erro.codigo === "negocio_fora_da_conversa") return NEGOCIO_FORA_DA_CONVERSA;
+  return { erro: recusa.erro };
+}
+
+const listarAnexosInputShape = {
+  lead_id: z.string().uuid(),
+  /**
+   * A chave do campo de ARQUIVO do funil, quando o agente quer só o que está
+   * naquele campo ("Voucher", "Apólice"). Omitida, devolve todos os anexos.
+   */
+  campo: z.string().trim().min(1).max(60).optional(),
+};
+
+export const crmListLeadAttachments: McpToolDefinition<typeof listarAnexosInputShape> = {
+  name: "crm_list_lead_attachments",
+  description:
+    "Lista os DOCUMENTOS ANEXADOS a um negócio: id, nome do arquivo, tipo, tamanho e data. " +
+    "É o primeiro passo quando o dado que o cliente pede está num documento (apólice, voucher, " +
+    "bilhete, confirmação de hotel): use o id devolvido em crm_get_lead_attachment para ler o " +
+    "conteúdo e depois registrar os valores com crm_propose_lead_fields_from_document. " +
+    "Só enxerga anexos de negócio desta conta; em conversa de atendimento, só do negócio deste cliente.",
+  inputSchema: listarAnexosInputShape,
+  category: "read",
+  requiresRole: "agent",
+  requiresScope: "mcp:read",
+  handler: async (input, ctx) => {
+    const pessoal = await recusaSeLeadDePessoal(ctx, input.lead_id);
+    if (pessoal) return pessoal;
+
+    const r = await listarAnexosDoNegocio(ctx.supabase, {
+      organizationId: ctx.organizationId,
+      leadId: input.lead_id,
+      contatoDoTurno: ctx.contatoDoTurno ?? null,
+      campo: input.campo ?? null,
+    });
+    if (!r.ok) return recusaDeAnexoComoResultado(r);
+
+    return { anexos: r.anexos, total: r.anexos.length };
+  },
+};
+
+const lerAnexoInputShape = {
+  lead_id: z.string().uuid(),
+  /** O id que `crm_list_lead_attachments` devolveu — nunca um id inventado. */
+  attachment_id: z.string().uuid(),
+};
+
+export const crmGetLeadAttachment: McpToolDefinition<typeof lerAnexoInputShape> = {
+  name: "crm_get_lead_attachment",
+  description:
+    "Lê o CONTEÚDO de um documento anexado ao negócio (o id vem de crm_list_lead_attachments) e devolve o " +
+    "texto extraído, para você tirar dali os valores do card. Documentos que são PDF com texto são lidos " +
+    `até ${TETO_DE_CARACTERES_DO_ANEXO / 1000}k caracteres por chamada — o que passar volta parcial, com o motivo. ` +
+    `Arquivo maior que ${TETO_DE_BYTES_DO_ANEXO / (1024 * 1024)} MB é recusado. IMAGEM e binário NÃO são transcritos nem ` +
+    "viram base64: a resposta traz conteudo vazio, legivel_como_texto=false e o motivo — nesse caso peça o dado a " +
+    "uma pessoa e nunca invente o que o arquivo diria. Depois de ler, registre os valores com " +
+    "crm_propose_lead_fields_from_document (que NÃO grava o card: a equipe confere).",
+  inputSchema: lerAnexoInputShape,
+  category: "read",
+  requiresRole: "agent",
+  requiresScope: "mcp:read",
+  handler: async (input, ctx) => {
+    const pessoal = await recusaSeLeadDePessoal(ctx, input.lead_id);
+    if (pessoal) return pessoal;
+
+    const r = await lerAnexoDoNegocio(ctx.supabase, {
+      organizationId: ctx.organizationId,
+      leadId: input.lead_id,
+      attachmentId: input.attachment_id,
+      contatoDoTurno: ctx.contatoDoTurno ?? null,
+    });
+    if (!r.ok) return recusaDeAnexoComoResultado(r);
+
+    return { anexo: r.anexo };
+  },
+};

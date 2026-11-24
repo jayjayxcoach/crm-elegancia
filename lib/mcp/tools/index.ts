@@ -1,0 +1,240 @@
+/**
+ * Catalogo agregado de tools MCP.
+ *
+ *  Wave 3 (S-13.03): 5 read tools (contacts, conversations, messages history).
+ *  Wave 4 (S-13.04): +3 read (leads list/get, pipelines list)
+ *                    +4 write (create_lead, update_lead, move_lead_stage, send_whatsapp)
+ *                    +1 handoff (request_human_handoff). Total 13 tools.
+ *  +1 write (start_conversation_and_send): cold-start de conversa nova num
+ *  canal escolhido, pra automação externa com chave (`requiresRole: manager`,
+ *  `apenasHumano` no catálogo — nunca alcançável pelo agente publicado).
+ */
+import type { McpToolDefinition } from "../types";
+import { amigoTools } from "./amigo";
+import { TOOL_CATALOG, VALID_TOOL_IDS } from "./catalog";
+import { crmSearchContacts, crmGetContact, crmProposeContactField } from "./contacts";
+import {
+  crmListConversations,
+  crmGetConversation,
+  crmGetConversationHistory,
+  crmCreateConversationDraft,
+} from "./conversations";
+import {
+  crmListLeads,
+  crmCountLeads,
+  crmGetLead,
+  crmCreateLead,
+  crmUpdateLead,
+  crmMoveLeadStage,
+  crmRetomarLead,
+  crmProposeLeadFieldsFromDocument,
+  crmListLeadAttachments,
+  crmGetLeadAttachment,
+} from "./leads";
+import { crmGetPipelineForecast, crmListPipelines } from "./pipelines";
+import { crmSendMaterial, crmSendWhatsappMessage } from "./messages";
+import { crmPublishWhatsappStatus } from "./status";
+import { crmStartConversationAndSend } from "./start-conversation";
+import {
+  crmAssignConversation,
+  crmManageTags,
+  crmGetQueueStatus,
+  crmSetConversationSector,
+} from "./governance";
+import {
+  crmListAvailableAttendants,
+  crmListHumanCases,
+  crmGetHumanCase,
+  crmAddCaseNote,
+  crmCloseHumanCase,
+  crmResumeAiAttendance,
+} from "./escalacao";
+import { crmRequestHumanHandoff } from "./handoff";
+import {
+  crmSearchKnowledge,
+  crmListKnowledgeSources,
+  crmListImprovementProposals,
+  crmGetOrgMemory,
+  crmSaveOrgMemory,
+} from "./evolucao";
+import { crmListContactOrders, crmSearchProducts } from "./comercio";
+import { crmGetHonorariosContrato, crmListHonorariosParcelas } from "./honorarios";
+import { crmDescribeExternalData, crmQueryExternalData } from "./dados-externos";
+import { crmConsultarReceita } from "./receitas-externas";
+import { crmListPrivacyRequests } from "./privacidade";
+import { crmGetProspectingSiteAudit } from "./prospeccao-site";
+import {
+  crmArchiveStage,
+  crmCreateStage,
+  crmCreateWebhookSource,
+  crmListAutomationRules,
+  crmListAutomationRuns,
+  crmListMessageTemplates,
+  crmListStages,
+  crmListTags,
+  crmListTeamMembers,
+  crmListWebhookSourceEvents,
+  crmListWebhookSources,
+  crmRenderMessageTemplate,
+  crmSetAutomationRuleActive,
+  crmSetWebhookSourceActive,
+  crmUpdateStage,
+} from "./operacao";
+import {
+  crmBookAppointment,
+  crmCancelAppointment,
+  crmConfirmAppointment,
+  crmFindAndBookAppointment,
+  crmFindFreeSlots,
+  crmListAppointments,
+  crmListEventTypes,
+  crmRescheduleAppointment,
+  crmSetAppointmentOutcome,
+} from "./agendamento";
+import {
+  crmScheduleFollowup,
+  crmEnrollFollowupFlow,
+  crmCancelFollowup,
+  crmListFollowups,
+  crmListAtRiskLeads,
+  crmCloseDemand,
+  crmProposeReactivation,
+} from "./retencao";
+import { crmDraftProposal, crmPrepararProposta } from "./propostas";
+import { crmCreateTask, crmListTasks, crmUpdateTask } from "./tarefas";
+import { crmSaveLeadDiagnosis } from "./diagnostico";
+
+// Cast via `unknown` porque McpToolDefinition<TInput> nao e covariante
+// em TInput (handler usa TInput em posicao contravariante). Coletar
+// definicoes heterogeneas em array unico exige apagar o input shape no
+// nivel do array — o server core ja recebe args como `Record<string,
+// unknown>` e cada handler valida no Zod do registerTool.
+export const allTools: ReadonlyArray<McpToolDefinition> = [
+  // módulo opcional `amigo` — fora do catálogo quando desligado (`deModuloDesligado`)
+  ...amigoTools,
+  // read
+  crmListEventTypes,
+  crmFindFreeSlots,
+  crmListAppointments,
+  crmSearchContacts,
+  crmGetContact,
+  crmProposeContactField,
+  crmListConversations,
+  crmGetConversation,
+  crmGetConversationHistory,
+  crmGetQueueStatus,
+  crmListLeads,
+  crmCountLeads,
+  crmGetLead,
+  // #4544 (item 2) — o documento anexado ao card: listar para descobrir o id,
+  // ler para tirar dali os valores. Entram logo depois do get_lead porque são a
+  // leitura do MESMO negócio, um nível abaixo.
+  crmListLeadAttachments,
+  crmGetLeadAttachment,
+  crmListPipelines,
+  crmGetPipelineForecast,
+  crmSearchKnowledge,
+  crmListKnowledgeSources,
+  crmListImprovementProposals,
+  crmGetOrgMemory,
+  crmSaveOrgMemory,
+  crmListContactOrders,
+  crmSearchProducts,
+  crmGetHonorariosContrato,
+  crmListHonorariosParcelas,
+  crmPrepararProposta,
+  crmDescribeExternalData,
+  crmQueryExternalData,
+  crmConsultarReceita,
+  crmListPrivacyRequests,
+  crmGetProspectingSiteAudit,
+  crmListTasks,
+  // read — organizar a operação (W4)
+  crmListStages,
+  crmListTags,
+  crmListMessageTemplates,
+  crmRenderMessageTemplate,
+  crmListWebhookSources,
+  crmListWebhookSourceEvents,
+  crmListAutomationRules,
+  crmListAutomationRuns,
+  crmListTeamMembers,
+  crmListFollowups,
+  crmListAtRiskLeads,
+  crmListAvailableAttendants,
+  crmListHumanCases,
+  crmGetHumanCase,
+  // write
+  // A que consulta E marca numa chamada só vem primeiro: quando o cliente já deu
+  // dia e hora, é o caminho curto, e é o que evita o turno morrer no meio (#831).
+  crmFindAndBookAppointment,
+  crmBookAppointment,
+  crmRescheduleAppointment,
+  crmCancelAppointment,
+  crmConfirmAppointment,
+  crmSetAppointmentOutcome,
+  crmCreateLead,
+  crmUpdateLead,
+  crmMoveLeadStage,
+  crmRetomarLead,
+  crmProposeLeadFieldsFromDocument,
+  // Diagnóstico da empresa na ficha do contato (decisão D7: grava direto).
+  crmSaveLeadDiagnosis,
+  crmSendWhatsappMessage,
+  // #4129 — o material cadastrado da empresa, como documento. Serve ao wire
+  // (API/MCP); no turno, o envio é da nativa `send_message` com `material_id`.
+  crmSendMaterial,
+  // Status não é mensagem: não tem destinatário nem conversa, e quem publica
+  // escolhe um PÚBLICO. Vem logo depois do envio porque é a outra forma de
+  // alcançar o cliente pelo mesmo número.
+  crmPublishWhatsappStatus,
+  crmStartConversationAndSend,
+  crmCreateConversationDraft,
+  crmAssignConversation,
+  crmManageTags,
+  // #3881 — a triagem da IA escolhe a FILA da conversa (módulo `setores`).
+  crmSetConversationSector,
+  // write — organizar a operação (W4)
+  crmCreateStage,
+  crmUpdateStage,
+  crmArchiveStage,
+  crmCreateWebhookSource,
+  crmSetWebhookSourceActive,
+  crmSetAutomationRuleActive,
+  crmScheduleFollowup,
+  crmEnrollFollowupFlow,
+  crmCancelFollowup,
+  crmCloseDemand,
+  crmProposeReactivation,
+  crmAddCaseNote,
+  crmCloseHumanCase,
+  crmResumeAiAttendance,
+  crmDraftProposal,
+  crmCreateTask,
+  crmUpdateTask,
+  // handoff (special)
+  crmRequestHumanHandoff,
+] as unknown as ReadonlyArray<McpToolDefinition>;
+
+// Sanity: catalogo estatico (importavel por client) deve cobrir 1:1 os handlers.
+// Erro em dev se alguem adicionar handler sem atualizar catalog.ts.
+if (process.env.NODE_ENV !== "production") {
+  const handlerNames = new Set(allTools.map((t) => t.name));
+  const catalogNames = new Set(TOOL_CATALOG.map((t) => t.name));
+  for (const n of handlerNames) {
+    if (!catalogNames.has(n)) {
+      throw new Error(`mcp/tools: handler "${n}" ausente em lib/mcp/tools/catalog.ts`);
+    }
+  }
+  for (const n of catalogNames) {
+    if (!handlerNames.has(n)) {
+      throw new Error(`mcp/tools: catalog "${n}" sem handler correspondente`);
+    }
+  }
+}
+
+export { VALID_TOOL_IDS };
+
+export function getToolByName(name: string): McpToolDefinition | undefined {
+  return allTools.find((t) => t.name === name);
+}

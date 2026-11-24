@@ -1,0 +1,198 @@
+# Prospecção nativa
+
+Em **CRM → Prospecção**, um administrador configura a chave Apify, pesquisa empresas por segmento/região e consulta dados comerciais. O adaptador usa o mesmo Actor Google Maps dos fluxos existentes. Não depende de n8n nem grava em Airtable.
+
+**Idioma.** A busca e o agente criado pela campanha seguem o idioma da organização (`organizations.locale`, `lib/prospecting/idioma.ts`). Em português do Brasil nada muda: a busca vai com `language: "pt-BR"` e país Brasil. Em espanhol, a busca pede os dados em espanhol (o rubro deixa de chegar como "Concessionária") e não prende o país no Brasil — quem diz onde buscar é a localização digitada ("Montevideo, Uruguay"); e o agente criado por **Configurar por conversa** nasce instruído a conversar em espanhol. Agente criado antes desta mudança continua com o prompt que tinha: ajuste no editor do agente, se for o caso.
+
+A busca é paga pelo saldo da conta Apify: limite de até 100 empresas e teto de US$ 0,50 a US$ 10 por execução. A quantidade pode ser menor. O enriquecimento consulta e-mails comerciais e redes do site, sem buscar pessoas físicas ou decisores. Chave cifrada por `fn_encrypt_oauth`, indisponível aos papéis do navegador. Não existe chave obrigatória no `.env`.
+
+### Buscar pela Scavio em vez da Apify
+
+A organização pode buscar as empresas do Google Maps pela API da Scavio. A Apify continua sendo o provedor de quem não escolhe outro, e a escolha de uma organização não muda nada para as outras.
+
+1. Escolha `scavio` em `organizations.settings.prospecting.provider`. Essa escolha ainda não tem tela; hoje é feita por SQL no banco:
+
+   ```sql
+   update organizations
+      set settings = coalesce(settings, '{}'::jsonb)
+        || jsonb_build_object('prospecting',
+             coalesce(settings->'prospecting', '{}'::jsonb) || '{"provider": "scavio"}'::jsonb)
+    where id = '<id da organização>';
+   ```
+
+2. Em **CRM → Prospecção**, salve a chave da Scavio no campo de chave (o rótulo ainda diz "Chave da Apify"). A chave é conferida em `GET /api/v1/usage`, que não gasta crédito, e fica cifrada como a da Apify.
+
+A busca usa o mesmo segmento e local do formulário e devolve até 20 empresas por página; cada página consome um crédito da conta Scavio, então uma busca de 100 empresas usa no máximo 5. Ela roda no tick seguinte do scheduler, sem execução para acompanhar. O teto em US$ e a opção "Enriquecer com e-mails comerciais e redes" são da Apify e não se aplicam aqui; a avaliação do site e a prévia seguem iguais. Se uma página depois da primeira falhar, a busca fica com o que já veio.
+
+Ao trocar de provedor, salve de novo a chave do provedor novo. A Scavio recusa, sem chamar a rede, uma chave que não é dela (as chaves da Scavio começam com `sk_`), e uma busca iniciada pela Apify antes da troca para com um aviso em vez de ser lida pela Scavio.
+
+### Lista própria (planilha)
+
+Se você já tem a lista de empresas (de uma feira, de uma associação, de uma planilha antiga), não precisa pagar uma busca: em **CRM → Prospecção**, no cartão "1. Encontrar empresas", abra a aba **Usar minha planilha**. Essa aba não depende da chave Apify nem de qualquer provedor de busca.
+
+- **Arquivo:** `.csv` ou `.xlsx` (só a primeira aba), com até **500 empresas**. Use "Baixar modelo" para ver o formato.
+- **Colunas obrigatórias:** o nome da empresa (`empresa`, `nome`, `nome fantasia`, `razão social`…) e o telefone (`telefone`, `celular`, `whatsapp`…). Opcionais: `site`, `segmento`, `cidade` (ou `endereço`), `email`, `instagram`/`facebook`/`linkedin`. Os nomes das colunas valem com ou sem acento, em maiúscula ou minúscula, e também em espanhol.
+- **O que a equipe já sabe (opcional):** as colunas `diagnostico`, `oferta` e `contexto` entram (uma coluna `observação` continua ignorada: é o nome comum de nota interna) como dado na primeira mensagem e preenchem a aba Diagnóstico do contato que a campanha criar, assinadas por quem importou. O que estiver em Contexto e em Diagnóstico pode aparecer na mensagem como fato; no modo em que a saída vai na segunda mensagem, só o contexto entra. Sem as colunas, a mensagem é a mesma de antes.
+- **Telefone:** brasileiro com DDD, com ou sem máscara, ou internacional com `+`. Linha sem telefone válido, sem nome ou com telefone repetido no arquivo é recusada, e a tela mostra o número da linha e o motivo para você corrigir e enviar de novo.
+- **De onde veio esta lista?** é obrigatório e fica registrado na campanha, para o caso de um titular perguntar de onde veio o dado dele.
+- **Quem já é contato do CRM não é abordado**, como em qualquer campanha. Quem já estava na sua lista de prospecção também não entra de novo.
+- **Enviar o mesmo arquivo duas vezes não duplica** a campanha nem as empresas.
+- **LGPD:** quem foi anonimizado a pedido do titular não volta por planilha, mesmo que o telefone venha escrito de outro jeito.
+- Nenhuma abordagem começa nesta etapa: a planilha vira uma campanha em preparação, e daí em diante é o caminho de sempre (seleção das empresas, avaliação do site, prévia, agente, ritmo e fila).
+
+### WhatsApp conferido antes da abordagem
+
+**Módulo opcional, desligado por padrão.** Quem administra o servidor liga em `/admin/sistema` › "Conferir WhatsApp na prospecção" (`MODULO_CONFERIR_WHATSAPP` em `platform_config`). A pergunta sai do número do cliente, para todo telefone achado (inclusive em rascunho que nunca será lançado), a qualquer hora e sem o aquecimento de número novo, num ritmo que ninguém mediu contra banimento. Desligado, nada é consultado, a lista não mostra contador e a abordagem segue como antes.
+
+O telefone que a empresa publicou nem sempre tem WhatsApp. Com o módulo ligado, depois da busca, o preparo automático pergunta ao WhatsApp, número por número, se ele existe lá (`check-exists` do WAHA, `lib/prospecting/whatsapp.ts`) — sem mandar mensagem nenhuma. A pergunta sai pela conexão da campanha e só por ela (se a campanha escolheu o número oficial, nada é conferido); antes de a conexão ser escolhida, por qualquer conexão WAHA conectada da organização. No máximo 15 números por minuto, com 2 segundos entre um e outro, porque quem consulta é o número do cliente.
+
+- **Tem WhatsApp:** a linha mostra "Tem WhatsApp" e segue normalmente.
+- **Sem WhatsApp:** a empresa sai da seleção (fica nas desmarcadas, com "Sem WhatsApp", e a caixa não a devolve), não ganha prévia de IA e não entra na fila; ao iniciar, vai para "Não abordado" com o motivo "Sem WhatsApp neste número.". Se ela já estava na fila de uma campanha pausada ou rodando, sai da fila com o mesmo motivo.
+- **Não é o prefixo que decide.** Medido numa busca real: um telefone fixo tinha WhatsApp Business. Descartar fixos por prefixo perderia essa empresa.
+- **WAHA fora do ar não descarta ninguém:** a rodada para sem gravar nada e tenta de novo no minuto seguinte.
+- **Sem conexão WAHA** (só canal oficial), nada é conferido e tudo segue como antes.
+
+Quando há ao menos um veredito, o contador da lista mostra "WhatsApp verificado: X de Y" e quantas ficaram fora. Cada rodada com efeito entra em `api_audit_log` como `prospecting.whatsapp_checked`, só com contagens.
+
+## Campanha
+
+Depois da pesquisa, defina agente, conexão, funil, etapa de entrada, etapa de qualificados, oferta, critérios, ritmo e referência real da avaliação de legítimo interesse. O agente precisa estar publicado, automático, com a ferramenta `crm_move_lead_stage` e acesso ao funil. Ele precisa atender o canal selecionado ou ser membro do roteador com continuidade ativa. O roteador pode encaminhar uma mudança de assunto para outro agente.
+
+### Criar um agente sem sair da campanha
+
+**Configurar por conversa** é o caminho principal de preparação da campanha.
+**Usar agente existente** conserva a seleção e configuração manual.
+Descreva o objetivo em suas palavras; a IA faz perguntas curtas sobre o que falta,
+aproveita os dados da campanha e propõe nome, abordagem, critério de qualificação,
+conexão e etapas. Você pode continuar conversando para corrigir o resumo.
+Não é necessário escolher ferramentas ou escrever um prompt técnico.
+
+A conversa usa a IA já configurada no CRM, pelo mesmo mecanismo de credenciais,
+orçamento e registro de custo. Ela só propõe: não recebe ferramentas de escrita,
+não cria agentes e não envia mensagens a contatos. IDs de conexão, funil e etapas
+são conferidos contra os recursos reais da organização.
+
+O resumo acompanha a conversa desde o início, mostra o que já foi definido e o que
+ainda falta. Sugestões permitem responder com um clique. O progresso fica salvo
+na campanha, separado da configuração que inicia a fila; duas abas não podem
+sobrescrever uma à outra silenciosamente. Falha ao salvar aparece na tela.
+
+**Testar como cliente** prepara um rascunho pausado e usa o mesmo sandbox do editor
+de agentes. O teste não publica, não muda o roteamento e não envia mensagens a
+contatos. Ferramentas de escrita são propostas, sem execução. Se a configuração
+mudar, o teste anterior deixa de representar o novo rascunho.
+
+O cartão de revisão mostra a abordagem, os critérios, o canal e o funil. **Publicar e usar agente**
+é a confirmação que publica o agente, prepara as capacidades comerciais e de
+transferência humana e o seleciona no formulário, com acesso ao funil escolhido.
+Ele pode receber conversas no canal; a campanha continua aguardando o comando
+separado **Iniciar abordagens com IA**. **Configurações avançadas** abre o editor existente.
+
+Quando o canal usa um roteador, o agente é acrescentado sem substituir os outros.
+Ativar a continuidade do mesmo agente, salvo mudança de assunto ou transferência,
+exige uma escolha explícita no cartão de revisão; a IA não pode autorizar essa alteração.
+Sem roteador, um canal atendido por outro agente exige reutilizar o agente atual
+ou configurar o roteamento, evitando trocar o atendimento existente sem aviso.
+Falhas mantêm a conversa e os dados da campanha. Repetir a mesma confirmação
+recupera a criação anterior sem produzir outro agente. O histórico de configuração
+é retomado ao recarregar a página; ele não é uma conversa de cliente no Inbox.
+Cancelar uma resposta interrompe a espera e propaga o cancelamento à chamada de IA.
+Isso não garante estorno de tokens que o provedor já tenha processado.
+
+### Assistente de voz
+
+O editor do agente oferece **Assistente de voz**, com configuração de ElevenLabs
+Agents. A integração é opcional e usa a conta ElevenLabs da organização. A chave
+fica cifrada no servidor; o navegador recebe somente uma autorização temporária
+para o teste. Voz, idioma, primeira mensagem e instruções podem ser revisados.
+
+O teste usa o microfone e o áudio do navegador. Ele não inicia chamadas para clientes
+nem conecta automaticamente o assistente a chamadas WhatsApp. A configuração de
+voz e a publicação do agente de texto são ações independentes. Alterações posteriores
+no prompt de texto precisam ser revisadas e salvas também na configuração de voz.
+
+A ativação separa as empresas (as desmarcadas, as sem telefone e as que já são contato do CRM ficam como "Não abordado") e enfileira o resto. **Quando a empresa entra no CRM é escolha da campanha** (`funnel_entry`, em "Quando a empresa entra no funil"): em **`on_send`** (o padrão de campanha nova) o contato, o negócio e a conversa nascem só na vez da empresa de ser abordada, e o funil mostra apenas quem foi abordado; em **`on_start`** (o que valia antes, e o que uma configuração gravada sem a chave continua sendo) tudo isso nasce, para a fila inteira, ao iniciar. Nos dois modos a criação usa os handlers existentes e é idempotente.
+
+**Mexer na fila depois de iniciada.** Com a campanha **pausada**, o operador marca e desmarca as empresas que ainda estão na fila (`select_in_queue` em `POST /api/v1/prospecting`). Desmarcar tira da fila quem está `queued` e a deixa como "Não abordado", com o motivo "Não selecionada pelo operador."; quem já teve tentativa (`sending`, `sent`, `failed`) não muda. Marcar de novo devolve só quem o operador tirou: quem o produto recusou (sem telefone, contato que já existia) não volta. Em `on_send` qualquer desmarcada pode voltar; em `on_start` só volta quem já tem conversa, porque a empresa desmarcada antes de iniciar nunca ganhou contato nem negócio. Em `on_start` o contato e o negócio das empresas enfileiradas já foram criados ao iniciar e **ficam no funil** quando elas são desmarcadas: o produto não tem como ocultar nem apagar negócio, e desmarcar só impede o envio. A tela esconde as desmarcadas por padrão ("Mostrar desmarcadas (N)"). **Excluir desmarcadas** (`discard_unselected`, com confirmação, em rascunho ou pausada) apaga a linha da busca de quem o operador tirou e que nunca virou registro do CRM, e nunca a linha-tomba de supressão de LGPD; como o telefone dessas linhas é o que evita que a mesma empresa reapareça como nova numa busca futura, excluir é aceitar que ela possa voltar em outra busca. A exclusão registra em `api_audit_log` quantas linhas saíram. Telefones e identificadores de empresa são únicos por organização; contatos anteriores são preservados. Uma preparação interrompida deve ser retomada com a mesma configuração. A fila começa após um minuto e envia somente a primeira abordagem. Respostas passam pelo atendimento normal; a qualificação exige os critérios definidos pelo operador e só é contada quando a etapa do negócio muda. Encontrar uma empresa não significa qualificá-la.
+
+Há uma campanha ativa por **número** (conexão de WhatsApp), até 50 tentativas em 24 horas **por número**, e intervalo mínimo de cinco minutos por número. Duas campanhas em conexões diferentes rodam ao mesmo tempo; a segunda no mesmo número é recusada com `prospecting_channel_busy` e o nome de quem ocupa a conexão (pausar a que está rodando libera o número). O teto de aquecimento (`tetoDiarioDaEsteiraFria`) e o intervalo também contam por número: a tentativa de um número não segura nem consome a cota de outro. Falhas e envios incertos consomem o limite. A janela do número, modo de teste, versão do agente, fechamento do atendimento, recusa, pausa e intervenção humana continuam ativos. Pausar interrompe novas abordagens; uma transmissão já iniciada pode concluir.
+
+### Quando a saída é oferecida
+
+A opção de parar de receber ("responda PARAR") é oferecida na **primeira mensagem por padrão** — o comportamento de sempre. A campanha pode atrasar a oferta para a **2ª mensagem automática** para aquela pessoa (`config.exit_offer = "second_message"`), escolhida no rádio "Quando oferecer a opção de parar de receber". Não há modo da 3ª: ficaria mais de uma mensagem a um desconhecido sem saída, segurada só pela instrução ao modelo (doc de decisão 170). No modo atrasado, a abertura não é comercial: só cumprimenta e confirma o contato, e o contexto do agente traz a mesma instrução. A saída vai na primeira mensagem automática depois da abertura, uma vez só (reserva atômica em `prospecting_candidates.exit_offered_at`); se o envio falhar, a contagem e a reserva se desfazem e a próxima mensagem leva a saída. Se voltar para a fila, a reserva fica, apontando para a mensagem guardada (`exit_offer_message_id`), que sai depois já com o rodapé; o reprocesso da mesma mensagem não conta de novo. Se essa mensagem falhar depois (canal pausado, organização suspensa, modo de teste, recusa do canal), um gatilho no banco devolve a contagem e a reserva e grava `prospecting.exit_offer_withdrawn` na auditoria, e a mensagem seguinte é a que leva a saída. O bloqueio por "PARAR" vale desde a primeira mensagem em todos os modos, independentemente do rodapé — ele mora na ingestão, não na oferta.
+
+**Dias da prospecção por conexão.** A primeira abordagem só sai nos dias marcados em **Conexões › Proteção de envio › Dias da prospecção** (`channel_knobs.prospeccao_dias`, 0=domingo … 6=sábado), dentro da janela de disparo do número. Fora do dia, o envio fica agendado para a próxima abertura, sem tentativa e sem queimar quota — a fila espera, não morre. Os dias são próprios da prospecção: desligar o domingo em **Enviar aos domingos** cala a resposta e os disparos em massa no domingo, mas não a prospecção (e vice-versa). Instalação nova nasce com todos os dias; quem tinha o domingo desligado migra com seg a sáb, e a mudança de dias entra em `api_audit_log` (`ai.pacing_knobs_updated`).
+
+**Ajustar o ritmo depois de iniciada.** Com a campanha **pausada**, o administrador troca o limite por dia (1 a 50) e o intervalo (5 a 1440 minutos) em **Editar ritmo**, ao lado de **Retomar fila**; a ação é `adjust_pace` em `POST /api/v1/prospecting` (issue #2095). O valor novo vale a partir do próximo envio. Só esses dois campos mudam: conexão, agente, funil, base legal e instrução da campanha seguem fixos depois de iniciada. A mudança entra em `api_audit_log` com o ritmo anterior e o novo.
+
+### De onde vem a primeira mensagem
+
+Por padrão, o ângulo da primeira mensagem vem da **estratégia do site**: a auditoria de cada empresa e as ofertas marcadas entram por cima do prompt do agente. A campanha pode escolher, no rádio **De onde vem a primeira mensagem** do passo de configuração, o **prompt do agente** (`config.fonte_da_abordagem = "agente"`): o roteiro do agente escolhido vira a referência principal e nenhum ângulo de auditoria entra na mensagem. Nos dois modos continuam valendo as regras de transparência da abordagem fria, a voz, o rascunho guardado e a oferta de saída (a regra decisória é uma só, `entradasDaAbordagem` em `lib/prospecting/estrategia-site.ts`, chamada pelo envio e pela prévia, para a tela e o envio não divergirem).
+
+- **Campanha anterior a esta opção (sem a chave) é `estrategia`:** nada muda para quem não escolhe. Não há migration nem variável de ambiente: a escolha mora no `config` jsonb da campanha.
+- **No modo `agente` a prévia não exige veredito do site:** a empresa pode ter a prévia gerada mesmo sem auditoria concluída.
+- **A prévia guardada de outra fonte não vale.** Trocar a fonte invalida as prévias escritas com a outra (a tela avisa "Prévia de outra abordagem: a campanha mudou a fonte"); abra **Ver detalhes** e gere outra. No modo `estrategia` a prévia continua caindo quando o site é verificado de novo; no `agente` ela não depende do site.
+- **"Ver detalhes"** abre **Detalhes da empresa**, com a prévia no topo e a auditoria do site embaixo, em bloco que abre expandido na estratégia e recolhido no agente.
+
+**Trocar a fonte com a campanha pausada.** Em **Editar instrução e critérios** (ao lado de **Editar ritmo**), o mesmo formulário que edita a instrução, os critérios, as ofertas e a ficha digital (`edit_briefing` em `POST /api/v1/prospecting`) traz o rádio **De onde vem a primeira mensagem**. O campo `fonte_da_abordagem` é opcional no corpo: ausente, a fonte não muda. A fila e as empresas não são tocadas e o próximo envio já sai pela fonte nova; conexão, agente, funil, base legal, ritmo e etiquetas seguem fixos. As prévias de quem está na fila são descartadas, e a prévia só volta a valer para o envio se tiver sido escrita com a fonte atual e com o texto atual (`briefing_editado_em`). Fora de campanha pausada com configuração gravada a resposta é 409 (404 se a campanha não é da organização da sessão). A mudança entra em `api_audit_log` (`prospecting.changed`) com a fonte anterior e a nova quando ela veio no pedido.
+
+**Usar lista em outra campanha.** Em campanha **pausada ou concluída**, **Usar lista em outra campanha** (`move_list`, com `request_id`) leva as empresas ainda não abordadas para uma **campanha nova em preparação**, onde se escolhe outra conexão, outro agente e outra abordagem, sem pagar a busca de novo (a campanha nova nasce com a busca concluída, a mesma pesquisa e sem configuração).
+
+- **MOVE, não copia.** Telefone e identificador da empresa são únicos por organização, e é isso que evita abordar a mesma empresa duas vezes. As empresas movidas voltam a `new`, marcadas e sem motivo, e perdem a prévia guardada.
+- **Vai só quem nunca foi abordado:** sem contato, negócio nem conversa, fora da supressão de LGPD, e com status `new`, `queued` ou desmarcada pelo operador. Quem foi enviado, falhou, já era contato ou foi recusado pelo produto (sem telefone, sem WhatsApp) fica na campanha antiga, com o histórico.
+- **Repetir é inofensivo:** o mesmo `request_id` devolve a mesma campanha sem mover nada a mais. Sem ninguém para levar, a resposta é 409 ("Não há empresas ainda não abordadas para levar.") e nenhuma campanha vazia é criada.
+- A trilha (`prospecting.changed`) guarda só a campanha nova, a contagem e se foi repetição, nunca linhas de empresas.
+
+**Resumo e Voz.** O resumo de cada campanha iniciada mostra **Primeira mensagem** (prompt do agente ou estratégia do site) e a **Voz** em vigor (ou "Sem voz definida"). O cartão **Voz e vocabulário** vale para todas as campanhas da organização e fica fora do bloco **Configurar busca**, então continua visível com a chave do provedor já salva; vem recolhido quando já há voz definida e aberto quando falta.
+
+**Arquivo da primeira abordagem (#4581, tela em #4751).** A campanha pode mandar um arquivo junto da primeira mensagem, igual para todos os candidatos (`config.midia_da_abordagem`: `storage_path` no bucket `whatsapp-media` sob `{org}/`, `media_mime` e `media_size_bytes`). Aceita imagem (JPG, PNG ou WEBP, até 5 MB), vídeo (MP4, 3GP ou MOV, até 16 MB) ou PDF (até 50 MB); a régua é `classificarMidiaDaAbordagem` em `lib/prospecting/midia-da-abordagem.ts`, e a posse do caminho é conferida em `validateConfig`. Na tela, o campo **Arquivo da primeira abordagem** da configuração lista as imagens já enviadas nas respostas rápidas (`message_templates.midias`), filtradas pela mesma régua, e permite remover o arquivo antes de iniciar; para usar uma imagem nova, anexe-a a uma resposta rápida. Vídeo e PDF, por enquanto, só pela ação `start` em `POST /api/v1/prospecting`. Como o resto da configuração, o arquivo fica fixo depois de iniciada. Cada número manda o arquivo em no máximo 30 abordagens por dia (`TETO_DIARIO_DE_MIDIA_POR_NUMERO`); acima disso, a abordagem do dia sai só com texto. Se o arquivo sumir do Storage, a campanha pausa com o motivo na tela.
+
+**Etiquetas do contato na abordagem (spec 27).** O passo de configuração tem **Etiquetas do contato**, pré-preenchido com o nicho da busca (até 5). Ao abordar uma empresa, a campanha grava essas etiquetas no contato antes da primeira mensagem, pela mesma junção da ação `add_tag`, e anuncia `contact.tag_added` quando alguma é nova. Assim, a skill com `any_tags` entra desde a primeira resposta. Falha ao gravar a etiqueta não derruba a abordagem: vai para o log e a empresa segue. Campanha sem a chave na configuração não grava nada. A troca depois de iniciada é a ação `adjust_tags` em `POST /api/v1/prospecting`, só com a campanha pausada, fechada ao token e auditada com a lista anterior e a nova; ela vale para os contatos criados dali em diante, e ainda não tem tela.
+
+## Operação e recuperação
+
+- Scheduler chama `/api/v1/cron/prospecting` a cada minuto, com segredo interno. Atualize a imagem do scheduler junto da aplicação. Em desenvolvimento, `pnpm dev:crons` inclui a mesma rota.
+- Busca sem confirmação nunca é repetida automaticamente: confira as execuções da Apify antes de iniciar outra.
+- Envio incerto não é reenviado automaticamente. O resultado e o link do Inbox ficam na campanha para revisão.
+- Erro de envio pausa a campanha. Retome depois de corrigir o agente, conexão ou atendimento; candidatos que falharam permanecem em revisão.
+- Novas extrações são iniciadas manualmente. Não há recarga automática de listas ou sequência de insistência para quem não respondeu.
+
+## Sistema vivo
+
+Entrada: administrador e pesquisa → `prospecting_campaigns/candidates`. Saída: `createContactHandler`, `createLeadHandler`, `sendMessageHandler` e turno do agente no Inbox. Comandos emitem `prospecting.changed`; cadastro e atendimento conservam as atividades canônicas. Resultados, erros e próximos envios aparecem em `/app/prospecting`, registrado no catálogo de navegação. A falha pausa a fila e exige revisão, e o resultado da conversa altera o estado exibido. A continuidade humana e IA usa o Inbox existente. Não responder não inicia novas insistências automaticamente; o operador revisa o histórico para decidir o próximo passo.
+
+Mapa: `docs/architecture/prospeccao-nativa.architecture.json`.
+
+### Checklist de continuidade: configuração e voz
+
+- **Entrada e saída:** o administrador conversa em `ProspectingAgentBuilder`; a sessão
+  pertence à campanha e prepara uma versão canônica em `ai_agents/ai_agent_versions`.
+  `VoiceAssistantPanel` usa esse agente para configurar um agente privado na ElevenLabs.
+- **Registro e superfície:** rotas de configuração usam a auditoria canônica; operações
+  de voz registram `ai_agent.updated` ou `ai_agent.tested`, sem credenciais. Resumo,
+  salvamento, resultado do teste e falhas aparecem nos respectivos painéis.
+- **Acesso e configuração:** menu Prospecção → Configurar por conversa; menu Agentes →
+  editor → Assistente de voz. O rascunho também oferece um link direto para essa aba.
+  Chave ausente e falha ao listar vozes têm mensagens e ações próprias.
+- **Recuperação:** revisão de sessão impede sobrescrita entre abas; tentativas mantêm
+  o mesmo identificador e distinguem preparar de publicar. Criação remota incerta
+  é reconciliada pelo marcador persistido antes de aceitar uma nova criação.
+- **Continuidade humana:** o teste pausado não transfere contatos. A publicação prepara
+  o handoff canônico do agente de texto. A voz neste incremento é uma sessão de teste
+  no navegador, sem ferramentas, transferência ou chamada para clientes; não abre
+  demanda no Inbox nem promete executar ações comerciais.
+- **Retorno e mapa:** conflito exige recarregar o estado; erro de provedor permite
+  corrigir e repetir a mesma tentativa. Divergência da configuração privada bloqueia
+  o teste de voz até nova sincronização. As entradas e saídas constam no mapa acima.
+
+### Anonimização e nova extração
+
+A anonimização canônica do contato também limpa telefone, endereço, e-mails,
+links e enriquecimento do candidato e o retira da fila. Tokens pseudônimos,
+restritos ao servidor e nunca devolvidos pela API, impedem reimportar a mesma
+origem ou telefone na organização. A exclusão de dados no provedor de busca
+segue o processo próprio desse provedor.
+
+O export de dados do contato inclui a origem, os dados coletados e o estado da
+abordagem dos candidatos vinculados a ele, com o mesmo escopo da anonimização.
+Não inclui tokens de supressão nem autorizações internas de envio.
