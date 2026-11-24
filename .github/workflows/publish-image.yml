@@ -967,3 +967,5 @@ jobs:
             [ "$APP" = "success" ]
             [ "$FUNDO" = "success" ]
           fi
+
+# crm-elegancia: imagen del CRM de Elegancia de Amor
